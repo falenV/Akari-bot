@@ -210,6 +210,13 @@ Every tunable is a constant at the top of `bot.js`. The most useful ones:
 └── akari-architecture.pdf
 ```
 
+A suggested .gitignore:
+
+node_modules/  
+.env  
+local_shortterm.db  
+local_shortterm.db-*
+
 
 ## Troubleshooting
 
