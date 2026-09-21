@@ -1,4 +1,3 @@
-
 -- Akari schema
 -- How to use: open your Supabase project -> SQL Editor -> New query, paste this whole file, and press Run. It is safe to run more than once: it only creates what is missing and never deletes data
 -- What it creates:
