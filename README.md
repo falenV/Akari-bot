@@ -79,7 +79,7 @@ score = 0.50 * similarity
 ## Installation
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/falenV/Akari-bot.git
 cd <your-repo>
 npm install
 ```
