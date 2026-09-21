@@ -9,7 +9,7 @@ import path from 'node:path';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 
-// 1. MODEL CONFIGURATION AND CONSTANTS
+// 1. MODEL CONFIGURATIONS AND CONSTANTS
 
 
 // Cognitive and Text Models
