@@ -206,14 +206,6 @@ Every tunable is a constant at the top of `bot.js`. The most useful ones:
 └── local_shortterm.db     # Created on first run (git-ignored)
 ```
 
-A suggested `.gitignore`:
-
-```
-node_modules/
-.env
-local_shortterm.db
-local_shortterm.db-*
-```
 
 ## Troubleshooting
 
