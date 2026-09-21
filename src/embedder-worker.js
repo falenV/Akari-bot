@@ -1,4 +1,4 @@
-// local MiniLM embedder runs in a dedicated worker thread so the CPU-bound matrix math involved in generating embeddings never blocks the main thread's event loop (and therefore never risks delaying Discord.js's gateway heartbeat), Must live alongside bot.js, it's loaded via `new Worker(path.join(__dirname, 'embedder-worker.js'))`
+// local MiniLM embedder runs in a dedicated worker thread so the CPU bound matrix math involved in generating embeddings never blocks the main thread's event loop (and therefore never risks delaying Discord.js's gateway heartbeat), Must live alongside bot.js, it's loaded via `new Worker(path.join(__dirname, 'embedder-worker.js'))`
 
 import { parentPort } from 'node:worker_threads';
 
