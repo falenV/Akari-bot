@@ -197,13 +197,17 @@ Every tunable is a constant at the top of `bot.js`. The most useful ones:
 
 ```
 .
-├── bot.js                 # Main process: Discord client, memory, reflection, social brain
-├── embedder-worker.js     # Worker thread running the MiniLM embedder
-├── schema.sql             # Supabase tables and functions
-├── package.json
-├── package-lock.json
-├── .env                   # Your secrets (git-ignored, you create this)
-└── local_shortterm.db     # Created on first run (git-ignored)
+├── src/
+│   ├── bot.js
+│   ├── embedder-worker.js
+│   ├── package.json
+│   └── package-lock.json
+├── schema.sql
+├── .env.example
+├── .gitignore
+├── LICENSE
+├── README.md
+└── akari-architecture.pdf
 ```
 
 
