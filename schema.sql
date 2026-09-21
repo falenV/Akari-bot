@@ -1,35 +1,25 @@
--- =============================================================================
--- Akari: Supabase schema
--- =============================================================================
--- How to use: open your Supabase project -> SQL Editor -> New query, paste this
--- whole file, and press Run. It is safe to run more than once: it only creates
--- what is missing and never deletes data.
---
+
+-- Akari schema
+-- How to use: open your Supabase project -> SQL Editor -> New query, paste this whole file, and press Run. It is safe to run more than once: it only creates what is missing and never deletes data
 -- What it creates:
 --   6 tables    long_term_memory, beliefs, belief_evidence, goals,
 --               user_profiles, relationship_state
 --   5 functions match_long_term_memory, find_similar_memory, reinforce_memories,
 --               decay_long_term_memory, belief_evidence_health
---
--- Important: the bot must use the service_role key as SUPABASE_KEY. Row Level
--- Security is enabled and public (anon) access is removed, so the anon key
--- cannot read or write these tables. Keep the service_role key on the server
--- only, and never commit it.
---
--- Discord IDs (guild_id) are stored as TEXT because they are 64-bit snowflakes.
--- Embeddings are 384-dimensional vectors (Xenova/all-MiniLM-L6-v2).
--- =============================================================================
+
+-- Important: the bot must use the service_role key as SUPABASE_KEY. Row Level Security is enabled and public (anon) access is removed, so the anon key cannot read or write these tables. Keep the service_role key on the server only, and never commit it
+-- Discord IDs (guild_id) are stored as TEXT because they are 64-bit snowflakes
+-- Embeddings are 384-dimensional vectors (Xenova/all-MiniLM-L6-v2)
 
 
--- -----------------------------------------------------------------------------
+
+
 -- 0. Extension
--- -----------------------------------------------------------------------------
+
 create extension if not exists vector with schema extensions;
 
 
--- -----------------------------------------------------------------------------
--- 1. Tables
--- -----------------------------------------------------------------------------
+
 
 -- Long-term memories: what Akari has learned about people and shared moments.
 create table if not exists public.long_term_memory (
@@ -52,16 +42,11 @@ create table if not exists public.long_term_memory (
 create index if not exists long_term_memory_guild_status_idx
     on public.long_term_memory (guild_id, status, created_at desc);
 
--- Optional: an approximate vector index. Not needed at small scale (a few thousand
--- memories search instantly and exactly without it). Because searches are filtered
--- by guild and status, an approximate index can return fewer rows than requested,
--- so it is left off by default. Uncomment once you have very large tables.
--- create index if not exists long_term_memory_embedding_idx
---     on public.long_term_memory using hnsw (embedding vector_cosine_ops);
 
 
--- Beliefs: durable impressions about a person (scope 'user'), the server
--- ('server'), or Akari herself ('self'). Confidence moves gradually.
+
+-- Beliefs: durable impressions about a person (scope 'user'), the server ('server'), or Akari herself ('self'). Confidence moves gradually
+
 create table if not exists public.beliefs (
     id              bigint generated always as identity primary key,
     guild_id        text             not null,
@@ -78,10 +63,8 @@ create table if not exists public.beliefs (
 create index if not exists beliefs_guild_idx on public.beliefs (guild_id);
 
 
--- Links each belief to the memories that support it. Deleting a belief removes
--- its links. memory_id deliberately has no foreign key: the model occasionally
--- cites a memory id that does not exist, and a foreign key would make the whole
--- batch of links fail. belief_evidence_health() ignores links to missing memories.
+-- Links each belief to the memories that support it. Deleting a belief removes its links. memory_id deliberately has no foreign key, the model occasionally cites a memory id that does not exist, and a foreign key would make the whole batch of links fail. belief_evidence_health() ignores links to missing memories.
+
 create table if not exists public.belief_evidence (
     belief_id  bigint not null references public.beliefs (id) on delete cascade,
     memory_id  bigint not null,
@@ -91,7 +74,7 @@ create table if not exists public.belief_evidence (
 create index if not exists belief_evidence_memory_idx on public.belief_evidence (memory_id);
 
 
--- Goals: small things Akari is curious about or working toward (max 5 active).
+-- Goals: small things Akari is curious about or working toward 
 create table if not exists public.goals (
     id            bigint generated always as identity primary key,
     guild_id      text             not null,
@@ -116,7 +99,7 @@ create table if not exists public.user_profiles (
 );
 
 
--- Rapport score (0 to 1) and a short "current read" of each user, per server.
+-- Rapport score (0 to 1) and a short "current read" of each user, per server
 create table if not exists public.relationship_state (
     guild_id      text             not null,
     user_name     text             not null,
@@ -127,12 +110,8 @@ create table if not exists public.relationship_state (
 );
 
 
--- -----------------------------------------------------------------------------
--- 2. Functions (called by the bot through supabase.rpc)
--- -----------------------------------------------------------------------------
 
--- Nearest-neighbour search over a server's live memories.
--- Returns cosine similarity (1 = identical). The bot re-ranks the results.
+
 create or replace function public.match_long_term_memory(
     query_embedding  vector(384),
     match_guild_id   text,
@@ -165,9 +144,7 @@ as $$
 $$;
 
 
--- Finds the single closest existing memory with the same nature and subject, if it
--- is at least `similarity_threshold` similar. Used to merge duplicates instead of
--- storing them twice. Forgotten memories are never matched.
+
 create or replace function public.find_similar_memory(
     query_embedding       vector(384),
     match_guild_id        text,
@@ -200,8 +177,8 @@ as $$
 $$;
 
 
--- Called when memories are recalled: bumps their access stats and brings a
--- 'fading' memory back to 'active'.
+-- Called when memories are recalled: bumps their access stats and brings a 'fading' memory back to 'active'
+
 create or replace function public.reinforce_memories(memory_ids bigint[])
 returns void
 language sql
@@ -215,20 +192,15 @@ as $$
 $$;
 
 
--- Forgetting curve, run at the start of every reflection cycle.
--- The bot's code calls this function but does not define the policy, so the policy
--- lives here. Each memory gets a "fade point" that grows with its importance:
---
+-- Forgetting curve, run at the start of every reflection cycle, The bot's code calls this function but does not define the policy, so the policy lives here, Each memory gets a "fade point" that grows with its importance:
 --     fade_days = 30 + 90 * importance      (importance 0.1 -> 39 days, 0.5 -> 75, 0.9 -> 111)
---
+
 -- Measured from the last time the memory was recalled (or created):
 --     idle >= 1x fade_days   active   -> fading
 --     idle >= 2x fade_days   fading   -> archived
 --     idle >= 4x fade_days   archived -> forgotten   (only if importance < 0.8)
---
--- Only 'active' and 'fading' memories are recalled. Nothing is ever deleted: rows
--- marked 'archived' or 'forgotten' stay in the table. Adjust the numbers below to
--- make Akari forget faster or slower.
+
+-- Only 'active' and 'fading' memories are recalled. Nothing is ever deleted, rows marked 'archived' or 'forgotten' stay in the table. Adjust the numbers below to make Akari forget faster or slower
 create or replace function public.decay_long_term_memory(target_guild_id text)
 returns void
 language sql
@@ -257,9 +229,7 @@ as $$
 $$;
 
 
--- For each belief: how many of its supporting memories exist, and how many are
--- still alive (active or fading). Beliefs whose evidence has mostly faded decay
--- faster. Beliefs with no evidence links simply do not appear in the result.
+-- For each belief: how many of its supporting memories exist, and how many are still alive (active or fading). Beliefs whose evidence has mostly faded decay faster, Beliefs with no evidence links simply do not appear in the result
 create or replace function public.belief_evidence_health(belief_ids bigint[])
 returns table (
     belief_id    bigint,
@@ -280,11 +250,8 @@ as $$
 $$;
 
 
--- -----------------------------------------------------------------------------
 -- 3. Security: server-side access only
--- -----------------------------------------------------------------------------
--- Row Level Security on with no policies means only the service_role key (which
--- bypasses RLS) can read or write. The anon and authenticated roles are cut off.
+-- Row Level Security on with no policies means only the service_role key (which bypasses RLS) can read or write, The anon and authenticated roles are cut off
 
 alter table public.long_term_memory   enable row level security;
 alter table public.beliefs            enable row level security;
@@ -317,13 +284,13 @@ begin
 end
 $$;
 
--- Make the API pick up the new tables and functions right away.
+-- Make the API pick up the new tables and functions right away
 notify pgrst, 'reload schema';
 
 
--- -----------------------------------------------------------------------------
+
 -- 4. Check: this should list 6 tables and 5 functions
--- -----------------------------------------------------------------------------
+
 select 'table' as kind, table_name::text as name
 from information_schema.tables
 where table_schema = 'public'
