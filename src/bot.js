@@ -15,49 +15,50 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Cognitive and Text Models
 const PRIMARY_MODEL = "deepseek/deepseek-v4-flash-0731";
 const FALLBACK_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free";
-const SOCIAL_MODEL = "openai/gpt-oss-20b:free";
+const SOCIAL_MODEL = "qwen/qwen3.8-27b:free";
 
-// OpenRouter's free-model catalog rotates constantly. These two slugs were confirmed, live as of July 2026, but verify at https://openrouter.ai/models before deploying.
+// OpenRouter's free-model catalog rotates constantly. These slugs were confirmed live as of September 2026, but verify at https://openrouter.ai/models before deploying
 
 const PRIMARY_VISION_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free";
 const FALLBACK_VISION_MODEL = "google/gemma-4-31b-it:free";
 
 const DISCORD_MAX_MESSAGE_LENGTH = 2000;
+const LLM_REQUEST_TIMEOUT_MS = 20000; // bounds how long a hung OpenRouter call can hold a channel's lock
 
-// Short-term history: a token budget instead of a flat message count, since a fixed count treats a one word message the same as a multi-paragraph one and disappears fast in an active server, SHORT_TERM_MAX_MESSAGES is a hard backstop regardless of token count.
 
 const SHORT_TERM_TOKEN_BUDGET = 9000;
 const SHORT_TERM_MAX_MESSAGES = 80;
 
-// Raw fact/working-memory capture
+
 
 const EXTRACTION_INTERVAL = 10;
 const WORKING_MEMORY_TTL_MINUTES = 30;
 
-// Deep reflection: beliefs, goals, profiles, rapport, memory decay. Expensive, infrequent.
+
 const REFLECTION_MESSAGE_INTERVAL = 150;
 const REFLECTION_MIN_INTERVAL_MINUTES = 180;
 const REFLECTION_TIMER_CHECK_MS = 30 * 60 * 1000; // background check for quiet channels
 const MAX_ACTIVE_BELIEFS = 25;
 const MAX_ACTIVE_GOALS = 5;
 
-// Long-term memory retrieval tuning
+
 const MEMORY_CANDIDATE_COUNT = 15; // fetched from pgvector before reranking
 const MEMORY_SIMILARITY_FLOOR = 0.35;
 const MEMORY_CONFIDENCE_FLOOR = 0.3;
 const MEMORY_MAX_RETURN = 8;
 const CONSOLIDATION_SIMILARITY_THRESHOLD = 0.86;
 
-// Relationship rapport: a single slowly-decaying scalar per user 
+
 
 const RAPPORT_BASELINE = 0.5;
 const RAPPORT_DECAY_HALFLIFE_DAYS = 10;
 
-// Belief evolution: beliefs are reinforced/weakened incrementally each reflection cycle
+const MAX_RAPPORT_CHANGE_PER_REFLECTION = 0.08;
+
 
 const BELIEF_MATCH_THRESHOLD = 0.83; // cosine similarity to treat a new statement as "the same belief"
-const BELIEF_LEARNING_RATE = 0.18; // reinforcement: how far confidence moves toward 1
-const BELIEF_DECAY_RATE = 0.15; // weakening: how far confidence moves toward 0
+const BELIEF_LEARNING_RATE = 0.18; // reinforcement, how far confidence moves toward 1
+const BELIEF_DECAY_RATE = 0.15; // weakening, how far confidence moves toward 0
 const BELIEF_NEW_STARTING_CONFIDENCE = 0.45;
 const BELIEF_PASSIVE_DECAY = 0.05; // per idle reflection cycle, for beliefs nobody reinforced or weakened
 const BELIEF_EVIDENCE_FADE_DECAY = 0.15; // stronger decay when most of a belief's evidence has faded
@@ -66,16 +67,16 @@ const BELIEF_PRUNE_THRESHOLD = 0.15; // beliefs below this confidence get droppe
 const EVENT_RETRIEVAL_BOOST = 0.08; // episodic memories surface slightly more readily than plain facts
 const SPEAKER_SUBJECT_BOOST = 0.06; // memories about whoever is currently speaking surface slightly more readily
 
-// Tiered reflection: cheap raw capture often (EXTRACTION_INTERVAL), belief/goal/profile reflection moderately (REFLECTION_MESSAGE_INTERVAL), and a rare, broader "who is AKARI becoming" self-reflection + belief dedup pass
+
 const MAJOR_REFLECTION_MESSAGE_INTERVAL = 1200;
 const MAJOR_REFLECTION_STALE_GOAL_DAYS = 21; // goals untouched this long get dropped as stale
 
 const THOUGHT_STREAM_CLEANUP_DAYS = 7; // consumed private thoughts older than this get purged
 const DIAGNOSTICS_RETENTION_DAYS = 30; // local telemetry used to tune constants against real usage
-const HISTORY_RETENTION_DAYS = 30; // raw local transcript purge -- long-term memory in Supabase is the durable record
+const HISTORY_RETENTION_DAYS = 30; // raw local transcript purge, long-term memory in Supabase is the durable record
 const HISTORY_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // once a day
 
-// Rate-limits the social-brain LLM call per channel
+
 const SOCIAL_BRAIN_MIN_INTERVAL_MS = 3000;
 
 const THREAD_IDLE_MINUTES = 60;
@@ -90,11 +91,11 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 
 
-if (DISCORD_TOKEN === "DISCORD_TOKEN") {
+if (!DISCORD_TOKEN) {
     console.error('[Startup Error] DISCORD_TOKEN environment variable is not set. Exiting.');
     process.exit(1);
 }
-if (OPENROUTER_KEY === "OPENROUTER_KEY") {
+if (!OPENROUTER_KEY) {
     console.error('[Startup Error] OPENROUTER_KEY environment variable is not set. Exiting.');
     process.exit(1);
 }
@@ -106,8 +107,13 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 
 let embedderWorker = null;
 let embedderReady = false;
+let embedderRestartAttempts = 0;
+const EMBEDDER_MAX_RESTART_ATTEMPTS = 5;
 const pendingEmbedRequests = new Map();
 let nextEmbedRequestId = 1;
+
+
+const EMBEDDING_MODEL_VERSION = 'Xenova/all-MiniLM-L6-v2';
 
 function initEmbedder() {
     try {
@@ -116,9 +122,11 @@ function initEmbedder() {
         embedderWorker.on('message', (msg) => {
             if (msg.type === 'ready') {
                 embedderReady = true;
+                embedderRestartAttempts = 0; 
                 console.log('[Embedder] MiniLM-L6-v2 initialized successfully (worker thread).');
             } else if (msg.type === 'init_error') {
                 console.warn('[Embedder Warning] Worker failed to initialize:', msg.error);
+                scheduleEmbedderRestart();
             } else if (msg.type === 'result') {
                 const pending = pendingEmbedRequests.get(msg.id);
                 if (pending) {
@@ -131,17 +139,35 @@ function initEmbedder() {
         embedderWorker.on('error', (err) => {
             console.warn('[Embedder Warning] Worker thread error:', err.message);
             embedderReady = false;
+            scheduleEmbedderRestart();
         });
         embedderWorker.on('exit', (code) => {
             if (code !== 0) console.warn(`[Embedder Warning] Worker thread exited with code ${code}`);
             embedderReady = false;
+            scheduleEmbedderRestart();
         });
     } catch (err) {
         console.warn('[Embedder Warning] Failed to start embedder worker thread:', err.message);
+        scheduleEmbedderRestart();
     }
 }
 
-// Produces a plain 384-length float array suitable for pgvector, or null if unavailable, Every caller in this file already treats null as "no embedding available" and degrades, gracefully (falls back to recency-based retrieval, skips consolidation, etc.), so a worker that's still starting up, crashed, or timed out fails safe rather than fails loud
+
+function scheduleEmbedderRestart() {
+    if (embedderRestartAttempts >= EMBEDDER_MAX_RESTART_ATTEMPTS) {
+        console.warn(`[Embedder Warning] Giving up after ${EMBEDDER_MAX_RESTART_ATTEMPTS} restart attempts. Semantic memory stays disabled until the process is restarted.`);
+        return;
+    }
+    const delayMs = 30000 * Math.pow(2, embedderRestartAttempts);
+    embedderRestartAttempts++;
+    console.warn(`[Embedder] Restarting worker in ${Math.round(delayMs / 1000)}s (attempt ${embedderRestartAttempts}/${EMBEDDER_MAX_RESTART_ATTEMPTS})...`);
+    setTimeout(() => {
+        try { embedderWorker?.terminate(); } catch { /* already dead, nothing to clean up */ }
+        initEmbedder();
+    }, delayMs);
+}
+
+
 
 async function embedText(text) {
     if (!embedderReady || !embedderWorker || !text) return null;
@@ -161,7 +187,7 @@ async function embedText(text) {
     });
 }
 
-// Local SQLite Database (Short-Term Brain)
+
 const db = new DatabaseSync('./local_shortterm.db');
 
 db.exec(`
@@ -230,9 +256,18 @@ db.exec(`
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
     CREATE INDEX IF NOT EXISTS idx_diagnostics_event ON diagnostics_log(event_type, created_at);
+    CREATE TABLE IF NOT EXISTS scheduler_state (
+        guild_id TEXT,
+        channel_id TEXT,
+        since_extraction INTEGER NOT NULL DEFAULT 0,
+        since_reflection INTEGER NOT NULL DEFAULT 0,
+        since_major_reflection INTEGER NOT NULL DEFAULT 0,
+        last_extracted_id INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (guild_id, channel_id)
+    );
 `);
 
-// Lightweight local telemetry for tuning the constants
+
 
 function logDiagnostic(guildId, channelId, eventType, payload) {
     try {
@@ -243,7 +278,7 @@ function logDiagnostic(guildId, channelId, eventType, payload) {
     }
 }
 
-// Supabase Cloud Database (Long-Term Memory, Beliefs, Goals, Profiles, Rapport) with Graceful Fallback
+
 let supabase = null;
 if (SUPABASE_URL && SUPABASE_KEY) {
     try {
@@ -585,8 +620,6 @@ const statsCommand = new SlashCommandBuilder()
 // 4. CORE HELPERS
 
 
-// Robust JSON parser that strips markdown code fences without touching whitespace inside string values, then attempts a couple of fallback recovery strategies
-
 function safeParseJSON(rawText) {
     if (!rawText) return null;
 
@@ -612,17 +645,21 @@ function safeParseJSON(rawText) {
 }
 
 
+function escapeLikePattern(str) {
+    return (str || '').replace(/[%_\\]/g, ch => '\\' + ch);
+}
+
 function clamp01(n) {
     return Math.max(0, Math.min(1, Number.isFinite(n) ? n : 0.5));
 }
 
-/** SQLite's CURRENT_TIMESTAMP is "YYYY-MM-DD HH:MM:SS" (UTC, no offset) -- make it Date-parseable. */
+
 function parseSqliteTimestamp(str) {
     if (!str) return null;
     return new Date(str.replace(' ', 'T') + 'Z');
 }
 
-// Rough token estimate (chars/4) good enough for budgeting, not exact for any specific tokenizer.
+
 function estimateTokens(text) {
     return Math.ceil((text || '').length / 4);
 }
@@ -647,14 +684,14 @@ function parseEmbedding(raw) {
  
 function getShortTermHistory(channelId) {
     const batch = db.prepare(`
-        SELECT role, user_name, content FROM history
+        SELECT role, user_id, user_name, content FROM history
         WHERE channel_id = ? ORDER BY id DESC LIMIT ?
     `).all(channelId, SHORT_TERM_MAX_MESSAGES);
 
     const kept = [];
     let tokenTotal = 0;
     for (const m of batch) {
-        const t = estimateTokens(m.content) + 8; // small overhead for role/name framing
+        const t = estimateTokens(m.content) + 8; 
         if (kept.length > 0 && tokenTotal + t > SHORT_TERM_TOKEN_BUDGET) break;
         kept.push(m);
         tokenTotal += t;
@@ -662,7 +699,15 @@ function getShortTermHistory(channelId) {
     return kept.reverse();
 }
 
-// Splits text into Discord-safe chunks (<=2000 chars), breaking on paragraph/sentence/word
+function buildNameIdMap(rows) {
+    const map = new Map();
+    for (const r of rows) {
+        if (r.role !== 'user' || !r.user_id || !r.user_name) continue;
+        map.set(r.user_name.toLowerCase(), r.user_id);
+    }
+    return map;
+}
+
  
 function chunkForDiscord(text, maxLen = DISCORD_MAX_MESSAGE_LENGTH) {
     if (!text) return [''];
@@ -683,7 +728,7 @@ function chunkForDiscord(text, maxLen = DISCORD_MAX_MESSAGE_LENGTH) {
     return chunks;
 }
 
-// Sends a possibly long reply as one or more messages, replying to the original for the first chunk.
+
 
 async function sendChunkedReply(message, text) {
     const chunks = chunkForDiscord(text);
@@ -705,7 +750,7 @@ function startTypingKeepAlive(channel) {
     return () => clearInterval(interval);
 }
 
-// so messages in the same channel can't race on reading-then-writing thread/history state, different channels still run fully in parallel
+
 
 const channelLocks = new Map();
 function withChannelLock(channelId, fn) {
@@ -718,14 +763,12 @@ function withChannelLock(channelId, fn) {
     return run;
 }
 
-// Strips both <@id> and <@!id> mention forms 
 
 function stripBotMention(content, botId) {
     const mentionRegex = new RegExp(`<@!?${botId}>`, 'g');
     return content.replace(mentionRegex, '').trim();
 }
 
-// Discord per-server nicknames are fully attacker-controlled and get interpolated directly into prompt text 
 
 
 function sanitizeDisplayName(rawName) {
@@ -750,7 +793,8 @@ async function callLLM(model, apiMessages, jsonMode = false, reasoningEffort = n
 
     try {
         const res = await axios.post('https://openrouter.ai/api/v1/chat/completions', payload, {
-            headers: { "Authorization": `Bearer ${OPENROUTER_KEY}`, "Content-Type": "application/json" }
+            headers: { "Authorization": `Bearer ${OPENROUTER_KEY}`, "Content-Type": "application/json" },
+            timeout: LLM_REQUEST_TIMEOUT_MS
         });
         return res.data.choices[0].message.content;
     } catch (err) {
@@ -759,7 +803,8 @@ async function callLLM(model, apiMessages, jsonMode = false, reasoningEffort = n
             logDiagnostic(null, null, 'llm_fallback', { failedModel: model, fallbackTo: FALLBACK_MODEL, error: err.message });
             payload.model = FALLBACK_MODEL;
             const res = await axios.post('https://openrouter.ai/api/v1/chat/completions', payload, {
-                headers: { "Authorization": `Bearer ${OPENROUTER_KEY}`, "Content-Type": "application/json" }
+                headers: { "Authorization": `Bearer ${OPENROUTER_KEY}`, "Content-Type": "application/json" },
+                timeout: LLM_REQUEST_TIMEOUT_MS
             });
             return res.data.choices[0].message.content;
         }
@@ -770,7 +815,6 @@ async function callLLM(model, apiMessages, jsonMode = false, reasoningEffort = n
 
 // 5. DEDICATED VISION PERCEPTION PIPELINE
 
-// Independent vision processor, converts image attachments into text descriptions.
  
 async function analyzeImages(imageUrls) {
     if (!imageUrls || imageUrls.length === 0) return null;
@@ -830,8 +874,6 @@ Keep it objective, natural, and under 120 words.`
 // 6. LONG-TERM MEMORY: EXTRACTION, CONSOLIDATION + SEMANTIC RETRIEVAL
 
 
-// Asks the LLM to merge two near-duplicate memory statements into one concise sentence
-
 async function mergeMemorySummaries(oldSummary, newSummary) {
     try {
         const raw = await callLLM(SOCIAL_MODEL, [
@@ -846,7 +888,7 @@ async function mergeMemorySummaries(oldSummary, newSummary) {
 
 
 
-async function storeLongTermMemories(guildId, entries) {
+async function storeLongTermMemories(guildId, entries, nameToId = new Map()) {
     if (!supabase || !entries || entries.length === 0) return;
 
     for (const entry of entries) {
@@ -854,6 +896,7 @@ async function storeLongTermMemories(guildId, entries) {
         const importance = clamp01(entry.importance ?? 0.5);
         const confidence = clamp01(entry.confidence ?? 0.7);
         const nature = entry.nature || 'fact';
+        const subjectId = entry.subject ? (nameToId.get(entry.subject.toLowerCase()) || null) : null;
         const embedding = await embedText(entry.summary);
 
         try {
@@ -863,6 +906,7 @@ async function storeLongTermMemories(guildId, entries) {
                     match_guild_id: guildId,
                     match_nature: nature,
                     match_subject: entry.subject || null,
+                    match_subject_id: subjectId,
                     similarity_threshold: CONSOLIDATION_SIMILARITY_THRESHOLD
                 });
 
@@ -872,6 +916,9 @@ async function storeLongTermMemories(guildId, entries) {
                     await supabase.from('long_term_memory').update({
                         summary: merged,
                         embedding: mergedEmbedding || embedding,
+                        embedding_model: EMBEDDING_MODEL_VERSION,
+
+                        subject_id: subjectId || similar[0].subject_id || null,
                         importance: Math.min(1, (similar[0].importance ?? importance) + 0.08),
                         evidence_count: (similar[0].evidence_count ?? 1) + 1,
                         status: 'active',
@@ -885,11 +932,13 @@ async function storeLongTermMemories(guildId, entries) {
             await supabase.from('long_term_memory').insert({
                 guild_id: guildId,
                 subject: entry.subject || null,
+                subject_id: subjectId,
                 summary: entry.summary,
                 nature,
                 importance,
                 confidence,
                 embedding,
+                embedding_model: EMBEDDING_MODEL_VERSION,
                 status: 'active',
                 last_accessed: new Date().toISOString()
             });
@@ -901,9 +950,36 @@ async function storeLongTermMemories(guildId, entries) {
 }
 
 
+
 async function runMemoryExtraction(guildId, channelId) {
-    const recent = getShortTermHistory(channelId);
-    if (recent.length === 0) return;
+    const cursorRow = db.prepare(`
+        SELECT last_extracted_id FROM scheduler_state WHERE guild_id = ? AND channel_id = ?
+    `).get(guildId, channelId);
+    const cursor = cursorRow?.last_extracted_id || 0;
+
+    const recent = db.prepare(`
+        SELECT id, role, user_id, user_name, content FROM history
+        WHERE guild_id = ? AND channel_id = ? AND id > ?
+        ORDER BY id ASC LIMIT ?
+    `).all(guildId, channelId, cursor, SHORT_TERM_MAX_MESSAGES);
+
+
+    if (recent.length === 0) {
+        db.prepare(`UPDATE scheduler_state SET since_extraction = 0 WHERE guild_id = ? AND channel_id = ?`).run(guildId, channelId);
+        return true;
+    }
+
+    const nameToId = buildNameIdMap(recent);
+
+
+    const advanceCursor = () => {
+        const maxId = recent[recent.length - 1].id;
+        db.prepare(`
+            INSERT INTO scheduler_state (guild_id, channel_id, last_extracted_id, since_extraction)
+            VALUES (?, ?, ?, 0)
+            ON CONFLICT(guild_id, channel_id) DO UPDATE SET last_extracted_id = excluded.last_extracted_id, since_extraction = 0
+        `).run(guildId, channelId, maxId);
+    };
 
     const transcript = recent.map(h => `${h.role === 'user' ? h.user_name : 'AKARI'}: ${h.content}`).join('\n');
 
@@ -923,7 +999,7 @@ nature guide:
 - "fact": a stable objective detail (job, location, owns a pet, etc.)
 - "preference": something they like/dislike
 - "relationship": how two people/entities relate to each other
-- "event": a specific shared experience or one-time happening -- phrase it narratively, e.g. "Last week, Zandar showed AIRI photos of his cat," not as a flat fact.
+- "event": a specific shared experience or one-time happening -- phrase it narratively, e.g. "Last week, Zandar showed Akari photos of his cat," not as a flat fact.
 
 importance: how much this would matter to remember months from now (a favorite hobby = high; an offhand one-time detail = low).
 confidence: how certain the transcript actually supports this (explicit statement = high; inference/guess = lower).
@@ -940,11 +1016,12 @@ Only include long_term entries worth remembering permanently. Only include worki
         const parsed = safeParseJSON(raw);
         if (!parsed) {
             logDiagnostic(guildId, channelId, 'extraction_result', { parseFailed: true });
-            return;
+
+            return false;
         }
 
         if (Array.isArray(parsed.long_term) && parsed.long_term.length > 0) {
-            await storeLongTermMemories(guildId, parsed.long_term);
+            await storeLongTermMemories(guildId, parsed.long_term, nameToId);
         }
 
         if (typeof parsed.private_thought === 'string' && parsed.private_thought.trim()) {
@@ -971,14 +1048,18 @@ Only include long_term entries worth remembering permanently. Only include worki
             workingCount: parsed.working?.length ?? 0,
             hadPrivateThought: typeof parsed.private_thought === 'string' && !!parsed.private_thought.trim()
         });
+        advanceCursor();
+        return true;
     } catch (err) {
         console.error('[Memory Extraction Error]', err.message);
+
+        return false;
     }
 }
 
-// Vision and memory bridge: right after Akari "sees" an image, ask whether it implies anything worth remembering long-term
 
-async function extractFromVision(guildId, userName, imageDescription) {
+
+async function extractFromVision(guildId, userName, imageDescription, userId = null) {
     if (!imageDescription || !supabase) return;
 
     const prompt = [
@@ -997,7 +1078,9 @@ Only include something if the image plausibly reveals a durable fact about the p
         const raw = await callLLM(SOCIAL_MODEL, prompt, true, 'low');
         const parsed = safeParseJSON(raw);
         if (parsed && Array.isArray(parsed.long_term) && parsed.long_term.length > 0) {
-            await storeLongTermMemories(guildId, parsed.long_term);
+
+            const nameToId = userId ? new Map([[userName.toLowerCase(), userId]]) : new Map();
+            await storeLongTermMemories(guildId, parsed.long_term, nameToId);
         }
     } catch (err) {
         console.error('[Vision Memory Extraction Error]', err.message);
@@ -1005,7 +1088,7 @@ Only include something if the image plausibly reveals a durable fact about the p
 }
 
 
-async function retrieveRelevantMemories(guildId, queryText, maxReturn = MEMORY_MAX_RETURN, speakerName = null) {
+async function retrieveRelevantMemories(guildId, queryText, maxReturn = MEMORY_MAX_RETURN, speakerName = null, speakerId = null) {
     if (!supabase) return [];
 
     const queryEmbedding = await embedText(queryText);
@@ -1029,11 +1112,18 @@ async function retrieveRelevantMemories(guildId, queryText, maxReturn = MEMORY_M
         try {
             const { data } = await supabase
                 .from('long_term_memory')
-                .select('id, summary, nature, importance, confidence, last_accessed, access_count')
+                .select('id, subject, subject_id, summary, nature, importance, confidence, status, last_accessed, access_count')
                 .eq('guild_id', guildId)
                 .in('status', ['active', 'fading'])
                 .order('created_at', { ascending: false })
                 .limit(maxReturn);
+
+            logDiagnostic(guildId, null, 'memory_retrieval', {
+                candidateCount: 0,
+                returnedCount: (data || []).length,
+                topScore: null,
+                fallbackUsed: true
+            });
             return data || [];
         } catch (e) {
             console.warn('[Supabase Fetch Warning] Cloud memory unavailable.');
@@ -1050,7 +1140,11 @@ async function retrieveRelevantMemories(guildId, queryText, maxReturn = MEMORY_M
             const accessScore = Math.min(1, Math.log(1 + (m.access_count || 0)) / Math.log(11));
             let blended = 0.5 * m.similarity + 0.25 * (m.importance ?? 0.5) + 0.15 * recencyScore + 0.10 * accessScore;
             if (m.nature === 'event') blended = Math.min(1, blended + EVENT_RETRIEVAL_BOOST);
-            if (speakerName && m.subject && m.subject.toLowerCase() === speakerName.toLowerCase()) {
+
+            const isSpeakerSubject = m.subject_id && speakerId
+                ? m.subject_id === speakerId
+                : Boolean(speakerName && m.subject && m.subject.toLowerCase() === speakerName.toLowerCase());
+            if (isSpeakerSubject) {
                 blended = Math.min(1, blended + SPEAKER_SUBJECT_BOOST);
             }
             return { ...m, blended };
@@ -1058,7 +1152,6 @@ async function retrieveRelevantMemories(guildId, queryText, maxReturn = MEMORY_M
         .sort((a, b) => b.blended - a.blended)
         .slice(0, maxReturn);
 
-    // Reinforcement: being retrieved nudges a "fading" memory back to "active" and bumps its access stats. Fire and forget so it doesn't add latency to the reply
     
     if (scored.length > 0) {
         supabase.rpc('reinforce_memories', { memory_ids: scored.map(m => m.id) }).then(({ error }) => {
@@ -1069,7 +1162,8 @@ async function retrieveRelevantMemories(guildId, queryText, maxReturn = MEMORY_M
     logDiagnostic(guildId, null, 'memory_retrieval', {
         candidateCount: candidates.length,
         returnedCount: scored.length,
-        topScore: scored[0]?.blended ?? null
+        topScore: scored[0]?.blended ?? null,
+        fallbackUsed: false
     });
 
     return scored;
@@ -1078,23 +1172,37 @@ async function retrieveRelevantMemories(guildId, queryText, maxReturn = MEMORY_M
 
 // 7. BELIEFS, GOALS AND REFLECTION
 
-// Pulls a small pool of candidate memories the reflection LLM can cite as evidence for a belief, the highest importance memories about each active user, plus the highest importance guild wide memories, kept small and importance ranked rather than exhaustive, this is a "what Akari might plausibly point to" not a full recall
 
 async function fetchCandidateMemoriesForReflection(guildId, activeUsers) {
     const pool = new Map();
 
-    for (const userName of activeUsers) {
+    for (const { name, id } of activeUsers) {
         try {
-            const { data } = await supabase.from('long_term_memory')
-                .select('id, subject, summary, nature, importance')
-                .eq('guild_id', guildId)
-                .in('status', ['active', 'fading'])
-                .ilike('subject', userName)
-                .order('importance', { ascending: false })
-                .limit(6);
-            (data || []).forEach(m => pool.set(m.id, m));
+            const queries = [
+                supabase.from('long_term_memory')
+                    .select('id, subject, summary, nature, importance')
+                    .eq('guild_id', guildId)
+                    .in('status', ['active', 'fading'])
+                    .is('subject_id', null)
+                    .ilike('subject', escapeLikePattern(name))
+                    .order('importance', { ascending: false })
+                    .limit(6)
+            ];
+            if (id) {
+                queries.push(
+                    supabase.from('long_term_memory')
+                        .select('id, subject, summary, nature, importance')
+                        .eq('guild_id', guildId)
+                        .in('status', ['active', 'fading'])
+                        .eq('subject_id', id)
+                        .order('importance', { ascending: false })
+                        .limit(6)
+                );
+            }
+            const results = await Promise.all(queries);
+            for (const { data } of results) (data || []).forEach(m => pool.set(m.id, m));
         } catch (err) {
-            console.warn('[Reflection] Candidate memory fetch failed for', userName, err.message);
+            console.warn('[Reflection] Candidate memory fetch failed for', name, err.message);
         }
     }
 
@@ -1113,7 +1221,6 @@ async function fetchCandidateMemoriesForReflection(guildId, activeUsers) {
     return Array.from(pool.values());
 }
 
-// Links a belief to the memories cited as its evidence (id-only rows)
 
 async function linkBeliefEvidence(beliefId, memoryIds) {
     if (!memoryIds || memoryIds.length === 0) return;
@@ -1128,7 +1235,7 @@ async function linkBeliefEvidence(beliefId, memoryIds) {
 
 
 
-async function applyBeliefUpdates(guildId, currentBeliefs, updates) {
+async function applyBeliefUpdates(guildId, currentBeliefs, updates, nameToId = new Map()) {
     const touched = new Set();
     const existing = currentBeliefs.map(b => ({ ...b, _embedding: parseEmbedding(b.embedding) }));
 
@@ -1136,12 +1243,18 @@ async function applyBeliefUpdates(guildId, currentBeliefs, updates) {
         if (!u.statement) continue;
         const scope = u.scope || 'user';
         const subject = u.subject || null;
+        const subjectId = subject ? (nameToId.get(subject.toLowerCase()) || null) : null;
         const embedding = await embedText(u.statement);
 
         let best = null, bestSim = 0;
         if (embedding) {
             for (const b of existing) {
-                if (b.scope !== scope || (b.subject || null) !== subject || !b._embedding) continue;
+                if (b.scope !== scope || !b._embedding) continue;
+        
+                const subjectMatches = (subjectId && b.subject_id)
+                    ? b.subject_id === subjectId
+                    : (b.subject || null) === subject;
+                if (!subjectMatches) continue;
                 const sim = cosineSimilarity(embedding, b._embedding);
                 if (sim > bestSim) { bestSim = sim; best = b; }
             }
@@ -1152,24 +1265,27 @@ async function applyBeliefUpdates(guildId, currentBeliefs, updates) {
             if (u.signal === 'weaken') {
                 newConfidence = best.confidence * (1 - BELIEF_DECAY_RATE);
             } else {
-                // "reinforce", "new" (mislabeled, it matched something existing), or unspecified
+               
                 newConfidence = best.confidence + (1 - best.confidence) * BELIEF_LEARNING_RATE;
             }
             await supabase.from('beliefs').update({
-                statement: u.statement, // keep the freshest phrasing
+                statement: u.statement,
                 confidence: clamp01(newConfidence),
                 evidence_count: (best.evidence_count || 1) + 1,
                 embedding,
+                embedding_model: EMBEDDING_MODEL_VERSION,
+              
+                subject_id: subjectId || best.subject_id || null,
                 last_updated: new Date().toISOString()
             }).eq('id', best.id);
             touched.add(best.id);
             await linkBeliefEvidence(best.id, u.evidence_memory_ids);
         } else if (u.signal !== 'weaken') {
-            // Genuinely new belief (A "weaken" signal for something that doesn't match anything existing is ignored because there's nothing to weaken.)
+           
             const { data: inserted, error } = await supabase.from('beliefs').insert({
-                guild_id: guildId, scope, subject, statement: u.statement,
+                guild_id: guildId, scope, subject, subject_id: subjectId, statement: u.statement,
                 confidence: BELIEF_NEW_STARTING_CONFIDENCE, evidence_count: 1,
-                embedding, last_updated: new Date().toISOString()
+                embedding, embedding_model: EMBEDDING_MODEL_VERSION, last_updated: new Date().toISOString()
             }).select('id').single();
             if (error) { console.warn('[Reflection] Belief insert failed:', error.message); continue; }
             if (inserted) {
@@ -1219,10 +1335,9 @@ async function passivelyDecayBeliefs(guildId, currentBeliefs, touchedIds) {
     }
 }
 
-// Deep, infrequent reflection pass: lets memories decay, then asks Akari to reinforce/weaken/add beliefs (durable impressions about people/the server/herself), revise active goals, and update per user profile + rapport, based on what's happened recently. Unlike memory extraction (raw fact capture)
 
 async function runReflectionCycle(guildId, channelId) {
-    if (!supabase) return;
+    if (!supabase) return true; 
     console.log(`[Reflection] Starting reflection cycle for guild ${guildId}...`);
 
     try {
@@ -1231,13 +1346,17 @@ async function runReflectionCycle(guildId, channelId) {
         });
 
         const recentHistory = getShortTermHistory(channelId);
-        if (recentHistory.length === 0) return;
+        if (recentHistory.length === 0) return true; 
         const transcript = recentHistory.map(h => `${h.role === 'user' ? h.user_name : 'AKARI'}: ${h.content}`).join('\n');
+        const nameToId = buildNameIdMap(recentHistory);
 
         const { data: currentBeliefs } = await supabase.from('beliefs').select('*').eq('guild_id', guildId);
         const { data: currentGoals } = await supabase.from('goals').select('*').eq('guild_id', guildId).eq('status', 'active');
         const activeUsers = [...new Set(recentHistory.filter(h => h.role === 'user').map(h => h.user_name))];
-        const candidateMemories = await fetchCandidateMemoriesForReflection(guildId, activeUsers);
+        const candidateMemories = await fetchCandidateMemoriesForReflection(
+            guildId,
+            activeUsers.map(name => ({ name, id: nameToId.get(name.toLowerCase()) || null }))
+        );
 
         const pendingThoughts = db.prepare(`
             SELECT id, thought FROM thought_stream
@@ -1253,7 +1372,7 @@ Review the transcript, your own recent private thoughts, and your current belief
 
 Beliefs are Akari's internal worldview -- durable impressions, not facts to look up later. scope "user" needs a subject (a username), scope "server" is about the community as a whole; scope "self" is about AKARI herself, subject null. For each belief you want to touch this cycle (whether reinforcing something already believed, weakening something contradicted, or something genuinely new), give: scope, subject, statement (phrase it fresh even if reinforcing something familiar), signal ("reinforce" | "weaken" | "new"), and evidence_memory_ids (integer ids from the "Available memories" list below that genuinely support it -- omit or leave empty if none apply, don't force a citation). Only include beliefs you're actually touching -- beliefs left out will fade a little on their own rather than being deleted, so you don't need to re-list everything every cycle.
 
-Goals are small, genuine things AKARI is curious about or hoping to do. Output the complete revised active list, at most ${MAX_ACTIVE_GOALS}.
+Goals are small, genuine things AKARI is curious about or hoping to do, at most ${MAX_ACTIVE_GOALS} active at a time. Only include a goal here if you're touching it this cycle: action "update" (still active, maybe with revised progress/priority -- match it to an existing goal by its exact current text), "complete" (accomplished, remove it), "drop" (no longer relevant, remove it), or "new" (something you're newly curious about). A goal you don't mention is left exactly as it is -- leaving it out is never treated as completing or abandoning it, only "complete"/"drop" do that.
 
 For each user in ${JSON.stringify(activeUsers)} you actually learned or noticed something new about this cycle, also give: a short synthesized one-paragraph profile (personality, interests, speaking style, inside jokes, relationships -- not a memory dump), a "rapport" 0-1 reflecting how warm the relationship currently feels (a nudge from the CHANGE you observed, not an absolute reset), and a short natural-language current_read of mood/interest (e.g. "curious and a bit playful lately"). Skip users you didn't learn anything new about.
 
@@ -1266,7 +1385,7 @@ ${candidateMemories.map(m => `${m.id}: ${m.summary}`).join('\n') || '(none yet)'
 Output strict JSON:
 {
   "beliefs": [ { "scope": "self"|"user"|"server", "subject": "username or null", "statement": "...", "signal": "reinforce"|"weaken"|"new", "evidence_memory_ids": [] } ],
-  "goals": [ { "goal": "...", "priority": 0.0-1.0, "progress": "..." } ],
+  "goals": [ { "action": "update"|"complete"|"drop"|"new", "goal": "exact current text for update/complete/drop, or new text for new", "priority": 0.0-1.0, "progress": "..." } ],
   "user_updates": [ { "user_name": "...", "profile_summary": "...", "rapport": 0.0-1.0, "current_read": "..." } ]
 }`
             },
@@ -1280,36 +1399,54 @@ Output strict JSON:
         const parsed = safeParseJSON(raw);
         if (!parsed) {
             logDiagnostic(guildId, channelId, 'reflection_result', { parseFailed: true });
-            return;
+            return false;
         }
 
         if (Array.isArray(parsed.beliefs)) {
-            const touched = await applyBeliefUpdates(guildId, currentBeliefs || [], parsed.beliefs);
+            const touched = await applyBeliefUpdates(guildId, currentBeliefs || [], parsed.beliefs, nameToId);
             await passivelyDecayBeliefs(guildId, currentBeliefs || [], touched);
         }
 
         if (Array.isArray(parsed.goals)) {
-            const oldGoalIds = (currentGoals || []).map(g => g.id);
-            const rows = parsed.goals
-                .slice(0, MAX_ACTIVE_GOALS)
-                .filter(g => g.goal)
-                .map(g => ({
+            const normalize = s => (s || '').trim().toLowerCase();
+            const byText = new Map((currentGoals || []).map(g => [normalize(g.goal), g]));
+            const idsToRemove = [];
+            const rowsToInsert = [];
+
+            for (const g of parsed.goals) {
+                if (!g.goal) continue;
+                const action = g.action || 'new';
+                const existing = byText.get(normalize(g.goal));
+
+                if (action === 'complete' || action === 'drop') {
+                    if (existing) idsToRemove.push(existing.id);
+                    continue;
+                }
+                
+                rowsToInsert.push({
                     guild_id: guildId,
                     goal: g.goal,
                     priority: clamp01(g.priority),
                     progress: g.progress || null,
                     status: 'active',
                     last_updated: new Date().toISOString()
-                }));
-          
-          
+                });
+                if (existing) idsToRemove.push(existing.id);
+            }
+
             try {
-                if (rows.length > 0) {
-                    const { error: insertError } = await supabase.from('goals').insert(rows);
+                if (idsToRemove.length > 0) {
+                    await supabase.from('goals').delete().in('id', idsToRemove);
+                }
+                if (rowsToInsert.length > 0) {
+                    const { error: insertError } = await supabase.from('goals').insert(rowsToInsert);
                     if (insertError) throw insertError;
                 }
-                if (oldGoalIds.length > 0) {
-                    await supabase.from('goals').delete().in('id', oldGoalIds);
+                const { data: allGoals } = await supabase.from('goals')
+                    .select('id, priority').eq('guild_id', guildId).eq('status', 'active')
+                    .order('priority', { ascending: false });
+                if (allGoals && allGoals.length > MAX_ACTIVE_GOALS) {
+                    await supabase.from('goals').delete().in('id', allGoals.slice(MAX_ACTIVE_GOALS).map(g => g.id));
                 }
             } catch (err) {
                 console.warn('[Reflection] Goal update failed, keeping previous active goals:', err.message);
@@ -1319,21 +1456,42 @@ Output strict JSON:
         if (Array.isArray(parsed.user_updates)) {
             for (const u of parsed.user_updates) {
                 if (!u.user_name) continue;
+
+                const userId = nameToId.get(u.user_name.toLowerCase()) || null;
+                const conflictTarget = userId ? 'guild_id,user_id' : 'guild_id,user_name';
+
+                if (userId) {
+   
+                    await supabase.from('user_profiles').update({ user_id: userId })
+                        .eq('guild_id', guildId).eq('user_name', u.user_name).is('user_id', null);
+                    await supabase.from('relationship_state').update({ user_id: userId })
+                        .eq('guild_id', guildId).eq('user_name', u.user_name).is('user_id', null);
+                }
+
                 if (u.profile_summary) {
                     await supabase.from('user_profiles').upsert({
                         guild_id: guildId,
+                        user_id: userId,
                         user_name: u.user_name,
                         summary: u.profile_summary,
                         updated_at: new Date().toISOString()
-                    }, { onConflict: 'guild_id,user_name' });
+                    }, { onConflict: conflictTarget });
                 }
+
+                const existingRapport = await fetchIdentityLinkedRow('relationship_state', guildId, userId, u.user_name, 'rapport, updated_at');
+                const currentRapport = existingRapport ? decayRapport(existingRapport.rapport, existingRapport.updated_at) : RAPPORT_BASELINE;
+                const proposedRapport = clamp01(u.rapport ?? RAPPORT_BASELINE);
+                const delta = Math.max(-MAX_RAPPORT_CHANGE_PER_REFLECTION, Math.min(MAX_RAPPORT_CHANGE_PER_REFLECTION, proposedRapport - currentRapport));
+                const newRapport = clamp01(currentRapport + delta);
+
                 await supabase.from('relationship_state').upsert({
                     guild_id: guildId,
+                    user_id: userId,
                     user_name: u.user_name,
-                    rapport: clamp01(u.rapport ?? RAPPORT_BASELINE),
+                    rapport: newRapport,
                     current_read: u.current_read || null,
                     updated_at: new Date().toISOString()
-                }, { onConflict: 'guild_id,user_name' });
+                }, { onConflict: conflictTarget });
             }
         }
 
@@ -1357,9 +1515,12 @@ Output strict JSON:
             thoughtsConsumed: pendingThoughts.length
         });
 
+        db.prepare(`UPDATE scheduler_state SET since_reflection = 0 WHERE guild_id = ? AND channel_id = ?`).run(guildId, channelId);
         console.log(`[Reflection] Cycle complete for guild ${guildId}.`);
+        return true;
     } catch (err) {
         console.error('[Reflection Error]', err.message);
+        return false;
     }
 }
 
@@ -1407,10 +1568,9 @@ async function dedupBeliefs(guildId) {
     return toDelete.size;
 }
 
-// The rare, broader reflection tier, dedupes the belief set, then takes a specific look at scope='self' beliefs "who is AKARI becoming" informed by AKARI's highest-importance memories across the *whole* guild rather than just the currently active users/channel, and finally drops goals that have sat active for a long time without being touched
 
 async function runMajorReflectionCycle(guildId, channelId) {
-    if (!supabase) return;
+    if (!supabase) return true;
     console.log(`[Major Reflection] Starting for guild ${guildId}...`);
 
     try {
@@ -1458,13 +1618,15 @@ Output strict JSON: { "beliefs": [ { "statement": "...", "signal": "reinforce"|"
             staleGoalsDropped: droppedGoals?.length ?? 0
         });
 
+        db.prepare(`UPDATE scheduler_state SET since_major_reflection = 0 WHERE guild_id = ? AND channel_id = ?`).run(guildId, channelId);
         console.log(`[Major Reflection] Complete for guild ${guildId}.`);
+        return true;
     } catch (err) {
         console.error('[Major Reflection Error]', err.message);
+        return false;
     }
 }
 
-// Decays a stored rapport value back toward baseline the longer it's gone unreinforced
 
 function decayRapport(storedValue, updatedAt) {
     if (storedValue == null) return RAPPORT_BASELINE;
@@ -1485,13 +1647,11 @@ function describeRapport(value) {
 // 8. SUBCONSCIOUS SOCIAL BRAIN: MULTI-THREAD CONVERSATION TRACKING
 
 
-// Builds a stable, order independent key for a set of participants
 
 function threadKeyFor(participants) {
     return [...new Set(participants.map(p => p.trim().toLowerCase()))].sort().join('|');
 }
 
-// Reads whatever conversation_threads rows are already on disk, with no LLM call used, whenever the real social brain call is being skipped or rate-limited (explicit mention, or a message landing inside the debounce window), Slightly stale is an acceptable trade for not spending an LLM round-trip on every single message; the transcript itself never loses anything regardless, since it's built from `history`, independent of whether the social brain "ran" for any particular message
 
 function getLocalThreadsBestEffort(guildId, channelId) {
     const rows = db.prepare(`
@@ -1501,7 +1661,6 @@ function getLocalThreadsBestEffort(guildId, channelId) {
     return rows.map(r => ({ ...r, participants: JSON.parse(r.participants || '[]') }));
 }
 
-// In-memory, per-channel, it's just a debounce clock
 
 const lastSocialBrainCallAt = new Map();
 function shouldCallSocialBrainNow(channelId) {
@@ -1549,7 +1708,7 @@ For each thread, determine:
   - "paused" = waiting for a later message.
   - "idle" = effectively over.
 - expected_next_speaker:
-  - "AKARI"
+  - "Akari"
   - username
   - "either"
   - "none"
@@ -1642,7 +1801,6 @@ function getWorkingMemoryString(guildId) {
     return working.length > 0 ? "\n\n# Working Memory (Session):\n" + working.map(w => `- [${w.subject_name}]: ${w.state_summary}`).join("\n") : "";
 }
 
-// Local, synchronous, just formatting whatever conversation_threads already produced.
 
 function buildSocialContextString(activeThread) {
     if (!activeThread) return "";
@@ -1650,28 +1808,51 @@ function buildSocialContextString(activeThread) {
 }
 
 
+async function fetchIdentityLinkedRow(table, guildId, userId, userName, selectCols) {
+    if (userId) {
+        const { data } = await supabase.from(table).select(selectCols)
+            .eq('guild_id', guildId).eq('user_id', userId).maybeSingle();
+        if (data) return data;
+    }
+    const { data: legacy } = await supabase.from(table).select(`${selectCols}, user_id`)
+        .eq('guild_id', guildId).eq('user_name', userName).maybeSingle();
+    if (legacy && userId && !legacy.user_id) {
+        supabase.from(table).update({ user_id: userId })
+            .eq('guild_id', guildId).eq('user_name', userName)
+            .then(({ error }) => {
+                if (error) console.warn(`[Identity] Failed to link ${table} row for`, userName, error.message);
+            });
+    }
+    return legacy;
+}
 
-async function getCognitiveCore(guildId, userName, userPrompt) {
+async function getCognitiveCore(guildId, userId, userName, userPrompt) {
     if (!supabase) return { memoryStr: "", beliefStr: "", goalStr: "", profileStr: "", rapportStr: "" };
 
-    const [memories, beliefsRes, goalsRes, profileRes, rapportRes] = await Promise.all([
-        retrieveRelevantMemories(guildId, `${userName}: ${userPrompt}`, MEMORY_MAX_RETURN, userName),
-        supabase.from('beliefs').select('*').eq('guild_id', guildId),
+    const [memories, beliefsRes, goalsRes, profile, rapport] = await Promise.all([
+        retrieveRelevantMemories(guildId, `${userName}: ${userPrompt}`, MEMORY_MAX_RETURN, userName, userId),
+        supabase.from('beliefs').select('scope, subject, subject_id, statement').eq('guild_id', guildId),
         supabase.from('goals').select('*').eq('guild_id', guildId).eq('status', 'active').order('priority', { ascending: false }),
-        supabase.from('user_profiles').select('summary').eq('guild_id', guildId).eq('user_name', userName).maybeSingle(),
-        supabase.from('relationship_state').select('*').eq('guild_id', guildId).eq('user_name', userName).maybeSingle()
+        fetchIdentityLinkedRow('user_profiles', guildId, userId, userName, 'summary'),
+        fetchIdentityLinkedRow('relationship_state', guildId, userId, userName, 'rapport, current_read, updated_at')
     ]);
 
     let memoryStr = "";
     if (memories.length > 0) {
-        memoryStr = "\n\n# Long-Term Memories:\n" + memories.map(m =>
-            m.nature === 'event' ? `- You recall: ${m.summary}` : `- [${m.nature}] ${m.summary}`
-        ).join("\n");
+
+        memoryStr = "\n\n# Long-Term Memories:\n" + memories.map(m => {
+            const hedge = (m.status === 'fading' || (m.confidence ?? 1) < 0.5) ? ' (this one feels uncertain, half-remembered)' : '';
+            return m.nature === 'event' ? `- You recall: ${m.summary}${hedge}` : `- [${m.nature}] ${m.summary}${hedge}`;
+        }).join("\n");
     }
 
     let beliefStr = "";
+
     const relevantBeliefs = (beliefsRes.data || []).filter(b =>
-        b.scope !== 'user' || (b.subject && b.subject.toLowerCase() === userName.toLowerCase())
+        b.scope !== 'user' || (
+            (b.subject_id && userId) ? b.subject_id === userId
+                : Boolean(b.subject && b.subject.toLowerCase() === userName.toLowerCase())
+        )
     );
     if (relevantBeliefs.length > 0) {
         beliefStr = "\n\n# Your Current Beliefs (your evolving worldview, these color how you act, they aren't facts to recite):\n" +
@@ -1684,20 +1865,19 @@ async function getCognitiveCore(guildId, userName, userPrompt) {
     }
 
     let profileStr = "";
-    if (profileRes.data?.summary) {
-        profileStr = `\n\n# Current User Profile (${userName}):\n${profileRes.data.summary}`;
+    if (profile?.summary) {
+        profileStr = `\n\n# Current User Profile (${userName}):\n${profile.summary}`;
     }
 
     let rapportStr = "";
-    if (rapportRes.data) {
-        const decayed = decayRapport(rapportRes.data.rapport, rapportRes.data.updated_at);
-        rapportStr = `\n\n# Sense of This Relationship:\n- ${describeRapport(decayed)}${rapportRes.data.current_read ? ` You've noticed: ${rapportRes.data.current_read}.` : ''}`;
+    if (rapport) {
+        const decayed = decayRapport(rapport.rapport, rapport.updated_at);
+        rapportStr = `\n\n# Sense of This Relationship:\n- ${describeRapport(decayed)}${rapport.current_read ? ` You've noticed: ${rapport.current_read}.` : ''}`;
     }
 
     return { memoryStr, beliefStr, goalStr, profileStr, rapportStr };
 }
 
-// reads back the diagnostics_log events logged throughout (social decisions, retrieval, consolidation, extraction/reflection outcomes, latency, fallback rates) plus a few live Supabase counts, and turns them into something readable without needing to write SQL by hand, Local event counts are global-fallback-inclusive (llm_fallback/vision_fallback are logged with guild_id=null since they're a model/provider property, not a per-server one)
 
 async function buildStatsReport(guildId) {
     const parseRows = (eventType, limit = 5000) => db.prepare(`
@@ -1739,6 +1919,7 @@ async function buildStatsReport(guildId) {
         `**Memory retrieval**`,
         `- Avg memories returned per reply: ${avg(retrievals, 'returnedCount')}`,
         `- Zero-result rate: ${pct(retrievals.filter(r => (r.returnedCount || 0) === 0).length, retrievals.length)}`,
+        `- Recency-fallback rate: ${pct(retrievals.filter(r => r.fallbackUsed).length, retrievals.length)} (embedder down or vector search returned nothing)`,
         `- Consolidation merge rate: ${pct(consolidations.filter(c => c.merged).length, consolidations.length)} (n=${consolidations.length} inserts checked)`,
         ``,
         `**Extraction / reflection**`,
@@ -1770,6 +1951,51 @@ async function buildStatsReport(guildId) {
     }
 
     return lines.join('\n');
+}
+
+const cognitiveLocks = new Set();
+
+function tryRunCognitiveJob(guildId, channelId, fn) {
+    const key = `${guildId}:${channelId}`;
+    if (cognitiveLocks.has(key)) return false;
+    cognitiveLocks.add(key);
+    Promise.resolve()
+        .then(fn)
+        .catch(err => console.error(`[Cognitive Lock] Job for ${key} threw:`, err.message))
+        .finally(() => cognitiveLocks.delete(key));
+    return true;
+}
+
+
+function runScheduledJobs(guildId, channelId) {
+    db.prepare(`
+        INSERT INTO scheduler_state (guild_id, channel_id, since_extraction, since_reflection, since_major_reflection)
+        VALUES (?, ?, 1, 1, 1)
+        ON CONFLICT(guild_id, channel_id) DO UPDATE SET
+            since_extraction = since_extraction + 1,
+            since_reflection = since_reflection + 1,
+            since_major_reflection = since_major_reflection + 1
+    `).run(guildId, channelId);
+
+    const state = db.prepare(`
+        SELECT since_extraction, since_reflection, since_major_reflection
+        FROM scheduler_state WHERE guild_id = ? AND channel_id = ?
+    `).get(guildId, channelId);
+
+
+    if (state.since_extraction >= EXTRACTION_INTERVAL) {
+        tryRunCognitiveJob(guildId, channelId, () => runMemoryExtraction(guildId, channelId));
+    }
+
+ 
+    if (state.since_reflection >= REFLECTION_MESSAGE_INTERVAL) {
+        tryRunCognitiveJob(guildId, channelId, () => runReflectionCycle(guildId, channelId));
+    }
+
+
+    if (state.since_major_reflection >= MAJOR_REFLECTION_MESSAGE_INTERVAL) {
+        tryRunCognitiveJob(guildId, channelId, () => runMajorReflectionCycle(guildId, channelId));
+    }
 }
 
 
@@ -1831,7 +2057,7 @@ client.on('messageCreate', async (message) => {
         const imageDescription = await analyzeImages(imageUrls);
         if (imageDescription) {
             visualContext = `\n\n[Visual Context - What Akari sees in attached image]:\n${imageDescription}`;
-            extractFromVision(guildId, userName, imageDescription).catch(err =>
+            extractFromVision(guildId, userName, imageDescription, message.author.id).catch(err =>
                 console.error('[Vision Memory Extraction Error]', err.message)
             );
         }
@@ -1841,13 +2067,14 @@ client.on('messageCreate', async (message) => {
 
     await withChannelLock(message.channel.id, async () => {
         try {
-            // Store User Message in History
+          
             db.prepare(`
                 INSERT INTO history (guild_id, channel_id, user_id, user_name, role, content, image_urls)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             `).run(guildId, message.channel.id, message.author.id, userName, 'user', fullMessageContent, JSON.stringify(imageUrls));
 
-            // Subconscious Social State (multi-thread), Skip the LLM call entirely on an explicit mention (the reply decision is already yes), and rate-limit it otherwise so a burst of rapid messages doesn't trigger one social-brain call per message, both cases fall back to the last-known thread state on disk nothing is lost since the transcript itself (built from `history`) always includes every message regardless of whether the social brain "ran" for that particular one
+        
+            runScheduledJobs(guildId, message.channel.id);
             
             const isExplicitMention = message.mentions.has(client.user);
             let threads;
@@ -1861,15 +2088,18 @@ client.on('messageCreate', async (message) => {
             } else {
                 threads = getLocalThreadsBestEffort(guildId, message.channel.id);
             }
-            const activeThread = threads.find(t =>
+    
+            const speakerThreads = threads.filter(t =>
                 t.participants.some(p => p.toLowerCase() === userName.toLowerCase())
             );
+            const activeThread = speakerThreads.find(t =>
+                (t.expected_next_speaker || '').toLowerCase() === 'akari'
+            ) || speakerThreads[0];
 
-            // Gatekeeper the question ("who's expected to speak next?")
         
             const shouldReply = isExplicitMention || (
                 activeThread &&
-                activeThread.expected_next_speaker === 'Akari' &&
+                (activeThread.expected_next_speaker || '').toLowerCase() === 'akari' &&
                 (activeThread.reply_probability ?? 0) >= REPLY_PROBABILITY_THRESHOLD
             );
 
@@ -1891,7 +2121,7 @@ client.on('messageCreate', async (message) => {
 
             try {              
                 
-                const cognitiveCore = await getCognitiveCore(guildId, userName, cleanText);
+                const cognitiveCore = await getCognitiveCore(guildId, message.author.id, userName, cleanText);
                 const cognitiveContext = getWorkingMemoryString(guildId) + buildSocialContextString(activeThread) +
                     cognitiveCore.memoryStr + cognitiveCore.beliefStr + cognitiveCore.goalStr + cognitiveCore.profileStr + cognitiveCore.rapportStr;
                 const pastMessages = getShortTermHistory(message.channel.id);
@@ -1901,7 +2131,7 @@ client.on('messageCreate', async (message) => {
                 ];
 
                 for (const m of pastMessages) {
-                    // Only user turns get a "Name:" prefix, Assistant turns are Akari's own past output, prefixing them with "Akari:" would make Akari always start its replies with "Akari:"
+       
                     formattedMessages.push({
                         role: m.role === 'user' ? 'user' : 'assistant',
                         content: m.role === 'user' ? `${m.user_name}: ${m.content}` : m.content
@@ -1912,7 +2142,7 @@ client.on('messageCreate', async (message) => {
                 const botReply = await callLLM(PRIMARY_MODEL, formattedMessages);
                 logDiagnostic(guildId, message.channel.id, 'main_reply', { latencyMs: Date.now() - replyStartedAt, replyLength: botReply.length });
 
-                // Send to Discord BEFORE recording it in local history. If sendChunkedReply throws missing permissions, network blip, or Discord outage, we don't want local history claiming Akari said something the user never actually received that would desync Akari's own short-term context from reality
+       
                
                 await sendChunkedReply(message, botReply);
 
@@ -1920,30 +2150,6 @@ client.on('messageCreate', async (message) => {
                     INSERT INTO history (guild_id, channel_id, user_id, user_name, role, content, image_urls)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                 `).run(guildId, message.channel.id, client.user.id, 'AKARI', 'assistant', botReply, "[]");
-
-                // Periodic housekeeping, all fire-and-forget so none of it blocks the reply:
-                const messageCount = db.prepare(`SELECT COUNT(*) AS n FROM history WHERE guild_id = ? AND channel_id = ?`).get(guildId, message.channel.id).n;
-
-                // Fast/cheap, raw fact + working memory capture, plus the occasional private thought
-                if (messageCount % EXTRACTION_INTERVAL === 0) {
-                    runMemoryExtraction(guildId, message.channel.id).catch(err =>
-                        console.error('[Memory Extraction Error]', err.message)
-                    );
-                }
-
-                // Moderate/deep: belief/goal/profile/rapport reflection + memory decay
-                if (messageCount % REFLECTION_MESSAGE_INTERVAL === 0) {
-                    runReflectionCycle(guildId, message.channel.id).catch(err =>
-                        console.error('[Reflection Error]', err.message)
-                    );
-                }
-
-                // Rare/expensive: belief dedup + "who is Akari becoming" self-reflection
-                if (messageCount % MAJOR_REFLECTION_MESSAGE_INTERVAL === 0) {
-                    runMajorReflectionCycle(guildId, message.channel.id).catch(err =>
-                        console.error('[Major Reflection Error]', err.message)
-                    );
-                }
             } catch (err) {
                 console.error("[Main LLM Error]", err.message);
                 await message.reply("*blinks* My thoughts got a bit tangled just now...").catch(() => {});
@@ -1956,7 +2162,7 @@ client.on('messageCreate', async (message) => {
     });
 });
 
-// Client Ready Event
+
 client.once('clientReady', async () => {
     console.log(`[Success] Akari 9.0 Cognitive Engine online as ${client.user.tag}`);
     try {
@@ -1970,14 +2176,13 @@ client.once('clientReady', async () => {
 
 // 11. BACKGROUND SCHEDULERS
 
-// "Background thinking" for channels that have gone quiet: reflection above is normally triggered by message volume, but a channel that never hits REFLECTION_MESSAGE_INTERVAL messages would otherwise never get reflected on, this periodic check catches that case roughly "nobody is talking... what have I learned recently?" without needing anyone to send a message first
 if (supabase) {
     setInterval(() => {
         const configs = db.prepare(`SELECT guild_id, channel_id FROM configs`).all();
         for (const cfg of configs) {
             const log = db.prepare(`SELECT last_reflection_at FROM reflection_log WHERE guild_id = ? AND channel_id = ?`).get(cfg.guild_id, cfg.channel_id);
             const lastMsg = db.prepare(`SELECT timestamp FROM history WHERE guild_id = ? AND channel_id = ? ORDER BY id DESC LIMIT 1`).get(cfg.guild_id, cfg.channel_id);
-            if (!lastMsg) continue; // nothing has ever been said here yet
+            if (!lastMsg) continue; 
 
             const lastReflectionAt = log ? parseSqliteTimestamp(log.last_reflection_at) : null;
             const lastMessageAt = parseSqliteTimestamp(lastMsg.timestamp);
@@ -1985,15 +2190,14 @@ if (supabase) {
             const alreadyReflectedOnLatest = lastReflectionAt && lastReflectionAt.getTime() > lastMessageAt.getTime();
 
             if (minutesSinceReflection >= REFLECTION_MIN_INTERVAL_MINUTES && !alreadyReflectedOnLatest) {
-                runReflectionCycle(cfg.guild_id, cfg.channel_id).catch(err =>
-                    console.error('[Reflection Error]', err.message)
-                );
+ .
+                tryRunCognitiveJob(cfg.guild_id, cfg.channel_id, () => runReflectionCycle(cfg.guild_id, cfg.channel_id));
             }
         }
     }, REFLECTION_TIMER_CHECK_MS);
 }
 
-// Diagnostics retention: purely local (SQLite), so this runs regardless of whether Supabase is configured
+
 
 setInterval(() => {
     db.prepare(`DELETE FROM diagnostics_log WHERE created_at <= datetime('now', '-' || ? || ' days')`).run(DIAGNOSTICS_RETENTION_DAYS);
