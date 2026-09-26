@@ -12,10 +12,9 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // 1. MODEL CONFIGURATIONS AND CONSTANTS
 
 
-// Cognitive and Text Models
 const PRIMARY_MODEL = "deepseek/deepseek-v4-flash-0731";
 const FALLBACK_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free";
-const SOCIAL_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free";
+const SOCIAL_MODEL = "nvidia/nemotron-3-super-120b-a12b:free";
 
 // OpenRouter's free-model catalog rotates constantly. These slugs were confirmed live as of September 2026, but verify at https://openrouter.ai/models before deploying
 
