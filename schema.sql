@@ -1,32 +1,74 @@
--- Akari schema 
--- How to use: open your Supabase project > SQL Editor > New query, paste this whole file, and press Run. It is safe to run more than once, including over a database that already ran an earlier version of this script, it only creates or alters what's missing/changed and never deletes data
+-- Akari schema (v3)
+-- How to use: open your Supabase project -> SQL Editor -> New query, paste this whole file, and press Run. It is safe to run more than once, including over a database that already ran an earlier version of this script: it only creates or alters what's missing/changed and never deletes data
+-- What it creates:
+--   6 tables    long_term_memory, beliefs, belief_evidence, goals,
+--               user_profiles, relationship_state
+--   5 functions match_long_term_memory, find_similar_memory, reinforce_memories,
+--               decay_long_term_memory, belief_evidence_health
 
+-- Important: the bot must use the service_role key as SUPABASE_KEY. Row Level Security is enabled and public (anon) access is removed, so the anon key cannot read or write these tables. Keep the service_role key on the server only, and never commit it
+-- Discord IDs (guild_id) are stored as TEXT because they are 64-bit snowflakes
+-- Embeddings are 384-dimensional vectors (Xenova/all-MiniLM-L6-v2). embedding_model records which
+-- model/version produced each vector, so a future embedding-model change doesn't silently mix
+-- incompatible vectors in the same column -- bot.js sets it on every insert and merge.
+--
+-- v2 change: match_long_term_memory now also returns `status`, so the persona prompt's
+-- "hedge on fading memories" instruction has something to actually check. Changing a SQL
+-- function's return columns needs a DROP before the CREATE (Postgres won't let CREATE OR
+-- REPLACE change output columns), so re-running this whole script on a v1 database is how you
+-- pick up that change -- it's still safe to run any number of times.
+--
+-- v3 change (identity migration): user_profiles and relationship_state were keyed on
+-- (guild_id, user_name) -- a Discord nickname, which anyone can change at any time. Changing it
+-- orphaned that person's profile/rapport and silently started them over under the new name.
+-- This adds a `user_id` (the stable Discord snowflake) to both tables and `subject_id` to
+-- beliefs/long_term_memory. Everything about this is additive: no primary key changes, no rows
+-- deleted, no old row ever becomes unreachable. bot.js resolves ids from local message history
+-- and self-heals old name-only rows the moment it sees that person again; migrate-user-ids.js
+-- does a one-time bulk backfill so you don't have to wait for that to happen organically.
+--
+-- Every function below is dropped and recreated rather than CREATE OR REPLACE'd, even the ones
+-- whose signature hasn't intentionally changed. CREATE OR REPLACE only works when Postgres
+-- considers the new definition's OUT-parameter row type identical to whatever's currently
+-- stored -- if it isn't (including from an old deployment this script's history didn't
+-- anticipate), it fails with "cannot change return type of existing function" instead of just
+-- updating it. An explicit drop-first costs nothing when nothing actually changed, and avoids
+-- that error permanently.
+
+
+
+
+-- 0. Extension
 
 create extension if not exists vector with schema extensions;
 
 
 
 
+-- Long-term memories: what Akari has learned about people and shared moments.
 create table if not exists public.long_term_memory (
     id              bigint generated always as identity primary key,
     guild_id        text             not null,
-    subject         text,                                  
-    subject_id      text,                                   
-    summary         text             not null,              
-    nature          text             not null default 'fact', 
+    subject         text,                                   -- usually a user name; null = general
+    subject_id      text,                                   -- stable Discord id for `subject`, when resolvable; null for non-person subjects or unresolved names
+    summary         text             not null,              -- one third-person sentence
+    nature          text             not null default 'fact', -- fact | preference | relationship | event
     importance      double precision not null default 0.5 check (importance between 0 and 1),
     confidence      double precision not null default 0.7 check (confidence between 0 and 1),
     embedding       vector(384),
-    embedding_model text,                                  
+    embedding_model text,                                  -- which model produced `embedding`; set by bot.js on insert/merge
     status          text             not null default 'active'
                         check (status in ('active', 'fading', 'archived', 'forgotten')),
-    evidence_count  integer          not null default 1,    
-    access_count    integer          not null default 0,    
+    evidence_count  integer          not null default 1,    -- how many times this was re-observed / merged
+    access_count    integer          not null default 0,    -- how many times it was recalled
     last_accessed   timestamptz      not null default now(),
     created_at      timestamptz      not null default now()
 );
 
-
+-- Picks up embedding_model/subject_id on a database that already ran an earlier version of this
+-- script: CREATE TABLE IF NOT EXISTS is a no-op once the table exists, so on an upgrade these
+-- columns only actually appear once this ALTER runs -- which is why it has to come before the
+-- indexes below that reference subject_id, not after.
 alter table public.long_term_memory add column if not exists embedding_model text;
 alter table public.long_term_memory add column if not exists subject_id text;
 
@@ -38,22 +80,27 @@ create index if not exists long_term_memory_subject_id_idx
 
 
 
+
+-- Beliefs: durable impressions about a person (scope 'user'), the server ('server'), or Akari herself ('self'). Confidence moves gradually
+
 create table if not exists public.beliefs (
     id              bigint generated always as identity primary key,
     guild_id        text             not null,
-    scope           text             not null default 'user', 
-    subject         text,                                     
-    subject_id      text,                                     
+    scope           text             not null default 'user', -- user | server | self
+    subject         text,                                     -- user name for scope 'user', else null
+    subject_id      text,                                     -- stable Discord id for `subject`, when resolvable
     statement       text             not null,
     confidence      double precision not null default 0.45 check (confidence between 0 and 1),
     evidence_count  integer          not null default 1,
     embedding       vector(384),
-    embedding_model text,                                     
+    embedding_model text,                                     -- which model produced `embedding`; set by bot.js on insert/merge
     last_updated    timestamptz      not null default now(),
     created_at      timestamptz      not null default now()
 );
 
-
+-- Same reasoning as long_term_memory above: this has to come before the index below that
+-- references subject_id, since that column only actually exists (on an upgrade, where CREATE
+-- TABLE was a no-op) once this ALTER runs.
 alter table public.beliefs add column if not exists embedding_model text;
 alter table public.beliefs add column if not exists subject_id text;
 
@@ -63,7 +110,7 @@ create index if not exists beliefs_subject_id_idx
     on public.beliefs (guild_id, subject_id) where subject_id is not null;
 
 
-
+-- Links each belief to the memories that support it. Deleting a belief removes its links. memory_id deliberately has no foreign key, the model occasionally cites a memory id that does not exist, and a foreign key would make the whole batch of links fail. belief_evidence_health() ignores links to missing memories.
 
 create table if not exists public.belief_evidence (
     belief_id  bigint not null references public.beliefs (id) on delete cascade,
@@ -73,7 +120,8 @@ create table if not exists public.belief_evidence (
 
 create index if not exists belief_evidence_memory_idx on public.belief_evidence (memory_id);
 
- 
+
+-- Goals: small things Akari is curious about or working toward 
 create table if not exists public.goals (
     id            bigint generated always as identity primary key,
     guild_id      text             not null,
@@ -88,11 +136,11 @@ create table if not exists public.goals (
 create index if not exists goals_guild_status_idx on public.goals (guild_id, status);
 
 
--- One-paragraph profile of each user, per server
+-- One-paragraph profile of each user, per server.
 create table if not exists public.user_profiles (
     guild_id    text        not null,
     user_name   text        not null,
-    user_id     text,                  
+    user_id     text,                  -- stable Discord id; nullable so this stays additive, see v3 note above
     summary     text        not null,
     updated_at  timestamptz not null default now(),
     primary key (guild_id, user_name)
@@ -100,12 +148,14 @@ create table if not exists public.user_profiles (
 
 alter table public.user_profiles add column if not exists user_id text;
 
-
+-- Lets bot.js look this row up by id once known, without touching the original name-based
+-- primary key. Partial (WHERE user_id IS NOT NULL) so legacy rows that haven't been linked yet
+-- -- which have user_id NULL -- never collide with each other under a plain unique index.
 create unique index if not exists user_profiles_guild_user_id_idx
     on public.user_profiles (guild_id, user_id) where user_id is not null;
 
 
-
+-- Rapport score (0 to 1) and a short "current read" of each user, per server
 create table if not exists public.relationship_state (
     guild_id      text             not null,
     user_name     text             not null,
@@ -122,6 +172,11 @@ create unique index if not exists relationship_state_guild_user_id_idx
     on public.relationship_state (guild_id, user_id) where user_id is not null;
 
 
+
+
+-- v3: also returns `subject_id`, so retrieveRelevantMemories's speaker-boost can match by the
+-- stable Discord id instead of only by name (a nickname change would otherwise silently stop
+-- the boost from firing for that person's own memories). Same drop-then-create reasoning as v2.
 drop function if exists public.match_long_term_memory(vector, text, integer);
 
 create function public.match_long_term_memory(
@@ -159,7 +214,11 @@ $$;
 
 
 
-
+-- v3: takes an optional match_subject_id, checked before the name-text match, again so a
+-- nickname change doesn't stop a duplicate from being recognized as the same memory. Adding a
+-- parameter changes a SQL function's identity just like changing a return column does, so this
+-- also needs an explicit drop of the old 5-argument version first -- CREATE OR REPLACE would
+-- otherwise leave that old version sitting alongside the new one instead of replacing it.
 drop function if exists public.find_similar_memory(vector, text, text, text, double precision);
 
 create function public.find_similar_memory(
@@ -202,8 +261,13 @@ as $$
 $$;
 
 
+-- Called when memories are recalled: bumps their access stats and brings a 'fading' memory back to 'active'
+-- Dropped first, same as the functions above -- CREATE OR REPLACE is only guaranteed safe when
+-- a function's signature genuinely never changed anywhere in its history, and an explicit drop
+-- costs nothing when it hasn't, so every function in this script uses it uniformly.
+drop function if exists public.reinforce_memories(bigint[]);
 
-create or replace function public.reinforce_memories(memory_ids bigint[])
+create function public.reinforce_memories(memory_ids bigint[])
 returns void
 language sql
 set search_path = public
@@ -216,8 +280,25 @@ as $$
 $$;
 
 
+-- Forgetting curve, run at the start of every reflection cycle, The bot's code calls this function but does not define the policy, so the policy lives here, Each memory gets a "fade point" that grows with its importance:
+--     fade_days = 30 + 90 * importance      (importance 0.1 -> 39 days, 0.5 -> 75, 0.9 -> 111)
 
-create or replace function public.decay_long_term_memory(target_guild_id text)
+-- Measured from the last time the memory was recalled (or created):
+--     idle >= 1x fade_days                    active   -> fading
+--     idle >= 2x fade_days                    fading   -> archived
+--     idle >= (4 + 4*importance)x fade_days   archived -> forgotten
+
+-- v2: the "forgotten" multiplier used to be a flat 4x, with importance >= 0.8 permanently exempt
+-- from ever reaching 'forgotten'. Combined with consolidation's +0.08-per-merge importance
+-- bump, four re-observations of the same memory (easy, given how often extraction windows
+-- overlap) was enough to make it immune forever. Now importance still buys a memory a much
+-- longer runway -- at 0.9 importance the forgotten threshold is ~844 days idle instead of ~111
+-- -- but nothing is permanently exempt.
+
+-- Only 'active' and 'fading' memories are recalled. Nothing is ever deleted, rows marked 'archived' or 'forgotten' stay in the table. Adjust the numbers below to make Akari forget faster or slower
+drop function if exists public.decay_long_term_memory(text);
+
+create function public.decay_long_term_memory(target_guild_id text)
 returns void
 language sql
 set search_path = public
@@ -245,8 +326,10 @@ as $$
 $$;
 
 
+-- For each belief: how many of its supporting memories exist, and how many are still alive (active or fading). Beliefs whose evidence has mostly faded decay faster, Beliefs with no evidence links simply do not appear in the result
+drop function if exists public.belief_evidence_health(bigint[]);
 
-create or replace function public.belief_evidence_health(belief_ids bigint[])
+create function public.belief_evidence_health(belief_ids bigint[])
 returns table (
     belief_id    bigint,
     total_count  integer,
@@ -266,7 +349,8 @@ as $$
 $$;
 
 
-
+-- 3. Security: server-side access only
+-- Row Level Security on with no policies means only the service_role key (which bypasses RLS) can read or write, The anon and authenticated roles are cut off
 
 alter table public.long_term_memory   enable row level security;
 alter table public.beliefs            enable row level security;
@@ -303,6 +387,8 @@ $$;
 notify pgrst, 'reload schema';
 
 
+
+-- 4. Check: this should list 6 tables and 5 functions
 
 select 'table' as kind, table_name::text as name
 from information_schema.tables
