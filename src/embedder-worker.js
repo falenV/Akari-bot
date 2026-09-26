@@ -1,4 +1,4 @@
-// local MiniLM embedder runs in a dedicated worker thread so the CPU bound matrix math involved in generating embeddings never blocks the main thread's event loop (and therefore never risks delaying Discord.js's gateway heartbeat), Must live alongside bot.js, it's loaded via `new Worker(path.join(__dirname, 'embedder-worker.js'))`
+// loaded via `new Worker(path.join(__dirname, 'embedder-worker.js'))`
 
 import { parentPort } from 'node:worker_threads';
 
@@ -7,7 +7,8 @@ let embedder = null;
 async function initEmbedder() {
     try {
         const { pipeline } = await import('@huggingface/transformers');
-        embedder = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2');
+
+        embedder = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2', { dtype: 'fp32' });
         parentPort.postMessage({ type: 'ready' });
     } catch (err) {
         parentPort.postMessage({ type: 'init_error', error: err.message });
