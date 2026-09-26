@@ -27,13 +27,21 @@
 -- and self-heals old name-only rows the moment it sees that person again; migrate-user-ids.js
 -- does a one-time bulk backfill so you don't have to wait for that to happen organically.
 --
--- Every function below is dropped and recreated rather than CREATE OR REPLACE'd, even the ones
--- whose signature hasn't intentionally changed. CREATE OR REPLACE only works when Postgres
--- considers the new definition's OUT-parameter row type identical to whatever's currently
--- stored -- if it isn't (including from an old deployment this script's history didn't
--- anticipate), it fails with "cannot change return type of existing function" instead of just
--- updating it. An explicit drop-first costs nothing when nothing actually changed, and avoids
--- that error permanently.
+-- Every function below is preceded by an explicit DROP FUNCTION IF EXISTS and defined with
+-- CREATE OR REPLACE rather than a bare CREATE. Two different failure modes made this necessary,
+-- both stemming from the same fact: running this script through Supabase's SQL editor does not
+-- behave like one all-or-nothing transaction -- if a later statement errors, statements earlier
+-- in the same run that already succeeded stay committed, they are not rolled back.
+--   1. CREATE OR REPLACE can't change a function's return columns or add a parameter (Postgres
+--      treats that as a different function entirely), so a signature change needs an explicit
+--      DROP of the OLD signature first.
+--   2. A bare CREATE (after that drop) fails if the NEW signature was already created in an
+--      earlier, partially-successful run of this same script -- the DROP above only removes the
+--      old signature, so if what's actually deployed is already the new one, the DROP is a
+--      no-op and a bare CREATE collides with it. CREATE OR REPLACE has no such problem: it
+--      succeeds whether the new signature already exists (trivially replacing itself) or not.
+-- Together, drop-old-if-present + create-or-replace-target is safe to run from any starting
+-- state -- fresh, an old version, a new version, or (as above) a half-applied one.
 
 
 
@@ -179,7 +187,7 @@ create unique index if not exists relationship_state_guild_user_id_idx
 -- the boost from firing for that person's own memories). Same drop-then-create reasoning as v2.
 drop function if exists public.match_long_term_memory(vector, text, integer);
 
-create function public.match_long_term_memory(
+create or replace function public.match_long_term_memory(
     query_embedding  vector(384),
     match_guild_id   text,
     match_count      integer default 15
@@ -221,7 +229,7 @@ $$;
 -- otherwise leave that old version sitting alongside the new one instead of replacing it.
 drop function if exists public.find_similar_memory(vector, text, text, text, double precision);
 
-create function public.find_similar_memory(
+create or replace function public.find_similar_memory(
     query_embedding       vector(384),
     match_guild_id        text,
     match_nature          text,
@@ -267,7 +275,7 @@ $$;
 -- costs nothing when it hasn't, so every function in this script uses it uniformly.
 drop function if exists public.reinforce_memories(bigint[]);
 
-create function public.reinforce_memories(memory_ids bigint[])
+create or replace function public.reinforce_memories(memory_ids bigint[])
 returns void
 language sql
 set search_path = public
@@ -298,7 +306,7 @@ $$;
 -- Only 'active' and 'fading' memories are recalled. Nothing is ever deleted, rows marked 'archived' or 'forgotten' stay in the table. Adjust the numbers below to make Akari forget faster or slower
 drop function if exists public.decay_long_term_memory(text);
 
-create function public.decay_long_term_memory(target_guild_id text)
+create or replace function public.decay_long_term_memory(target_guild_id text)
 returns void
 language sql
 set search_path = public
@@ -329,7 +337,7 @@ $$;
 -- For each belief: how many of its supporting memories exist, and how many are still alive (active or fading). Beliefs whose evidence has mostly faded decay faster, Beliefs with no evidence links simply do not appear in the result
 drop function if exists public.belief_evidence_health(bigint[]);
 
-create function public.belief_evidence_health(belief_ids bigint[])
+create or replace function public.belief_evidence_health(belief_ids bigint[])
 returns table (
     belief_id    bigint,
     total_count  integer,
