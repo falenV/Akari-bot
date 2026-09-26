@@ -2164,7 +2164,7 @@ client.on('messageCreate', async (message) => {
 
 
 client.once('clientReady', async () => {
-    console.log(`[Success] Akari 9.0 Cognitive Engine online as ${client.user.tag}`);
+    console.log(`[Success] Akari 10.0 Cognitive Engine online as ${client.user.tag}`);
     try {
         await client.application.commands.set([setupCommand, disableCommand, statsCommand]);
     } catch (err) {
