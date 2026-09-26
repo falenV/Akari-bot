@@ -1,7 +1,5 @@
--- Akari schema
--- How to use: open your Supabase project > SQL Editor > New query, paste this whole file, and press Run. It is safe to run more than once, including over a database that already ran an earlier version of this script: it only creates or alters what's missing/changed and never deletes data
-
-
+-- Akari schema 
+-- How to use: open your Supabase project > SQL Editor > New query, paste this whole file, and press Run. It is safe to run more than once, including over a database that already ran an earlier version of this script, it only creates or alters what's missing/changed and never deletes data
 
 
 create extension if not exists vector with schema extensions;
@@ -28,18 +26,15 @@ create table if not exists public.long_term_memory (
     created_at      timestamptz      not null default now()
 );
 
+
+alter table public.long_term_memory add column if not exists embedding_model text;
+alter table public.long_term_memory add column if not exists subject_id text;
+
 create index if not exists long_term_memory_guild_status_idx
     on public.long_term_memory (guild_id, status, created_at desc);
 
 create index if not exists long_term_memory_subject_id_idx
     on public.long_term_memory (guild_id, subject_id) where subject_id is not null;
-
-
-alter table public.long_term_memory add column if not exists embedding_model text;
-alter table public.long_term_memory add column if not exists subject_id text;
-
-
-
 
 
 
@@ -58,14 +53,14 @@ create table if not exists public.beliefs (
     created_at      timestamptz      not null default now()
 );
 
+
+alter table public.beliefs add column if not exists embedding_model text;
+alter table public.beliefs add column if not exists subject_id text;
+
 create index if not exists beliefs_guild_idx on public.beliefs (guild_id);
 
 create index if not exists beliefs_subject_id_idx
     on public.beliefs (guild_id, subject_id) where subject_id is not null;
-
-
-alter table public.beliefs add column if not exists embedding_model text;
-alter table public.beliefs add column if not exists subject_id text;
 
 
 
@@ -78,8 +73,7 @@ create table if not exists public.belief_evidence (
 
 create index if not exists belief_evidence_memory_idx on public.belief_evidence (memory_id);
 
-
-
+ 
 create table if not exists public.goals (
     id            bigint generated always as identity primary key,
     guild_id      text             not null,
@@ -94,10 +88,11 @@ create table if not exists public.goals (
 create index if not exists goals_guild_status_idx on public.goals (guild_id, status);
 
 
+-- One-paragraph profile of each user, per server
 create table if not exists public.user_profiles (
     guild_id    text        not null,
     user_name   text        not null,
-    user_id     text,                 
+    user_id     text,                  
     summary     text        not null,
     updated_at  timestamptz not null default now(),
     primary key (guild_id, user_name)
@@ -114,7 +109,7 @@ create unique index if not exists user_profiles_guild_user_id_idx
 create table if not exists public.relationship_state (
     guild_id      text             not null,
     user_name     text             not null,
-    user_id       text,                            
+    user_id       text,                             -- stable Discord id; nullable, see v3 note above
     rapport       double precision not null default 0.5 check (rapport between 0 and 1),
     current_read  text,
     updated_at    timestamptz      not null default now(),
@@ -125,9 +120,6 @@ alter table public.relationship_state add column if not exists user_id text;
 
 create unique index if not exists relationship_state_guild_user_id_idx
     on public.relationship_state (guild_id, user_id) where user_id is not null;
-
-
-
 
 
 drop function if exists public.match_long_term_memory(vector, text, integer);
@@ -208,7 +200,6 @@ as $$
     order by m.embedding <=> query_embedding
     limit 1;
 $$;
-
 
 
 
@@ -308,9 +299,8 @@ begin
 end
 $$;
 
-
+-- Make the API pick up the new tables and functions right away
 notify pgrst, 'reload schema';
-
 
 
 
