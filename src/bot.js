@@ -15,7 +15,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Cognitive and Text Models
 const PRIMARY_MODEL = "deepseek/deepseek-v4-flash-0731";
 const FALLBACK_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free";
-const SOCIAL_MODEL = "qwen/qwen3.8-27b:free";
+const SOCIAL_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free";
 
 // OpenRouter's free-model catalog rotates constantly. These slugs were confirmed live as of September 2026, but verify at https://openrouter.ai/models before deploying
 
@@ -2190,7 +2190,7 @@ if (supabase) {
             const alreadyReflectedOnLatest = lastReflectionAt && lastReflectionAt.getTime() > lastMessageAt.getTime();
 
             if (minutesSinceReflection >= REFLECTION_MIN_INTERVAL_MINUTES && !alreadyReflectedOnLatest) {
- .
+                
                 tryRunCognitiveJob(cfg.guild_id, cfg.channel_id, () => runReflectionCycle(cfg.guild_id, cfg.channel_id));
             }
         }
