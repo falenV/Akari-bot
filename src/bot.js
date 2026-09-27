@@ -72,12 +72,7 @@ const MAJOR_REFLECTION_STALE_GOAL_DAYS = 21; // goals untouched this long get dr
 const THOUGHT_STREAM_CLEANUP_DAYS = 7; // consumed private thoughts older than this get purged
 const DIAGNOSTICS_RETENTION_DAYS = 30; // local telemetry used to tune constants against real usage
 const HISTORY_RETENTION_DAYS = 30; // raw local transcript purge -- long-term memory in Supabase is the durable record
-// If extraction has been broken for an extended stretch (a model outage, say), the normal purge
-// below now skips anything past a channel's extraction cursor rather than deleting it -- so an
-// outage doesn't silently lose content that was never processed. This is the backstop for that:
-// even never-extracted content doesn't accumulate forever, it just gets a much longer grace
-// period than normally-extracted content does, on the assumption a 3x-longer outage than the
-// standard retention window is already a bigger problem than this bot can route around.
+
 const HISTORY_HARD_RETENTION_DAYS = 90;
 const HISTORY_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // once a day
 
@@ -126,7 +121,7 @@ function initEmbedder() {
         embedderWorker.on('message', (msg) => {
             if (msg.type === 'ready') {
                 embedderReady = true;
-                embedderRestartAttempts = 0; // healthy again -- reset the backoff counter
+                embedderRestartAttempts = 0; 
                 console.log('[Embedder] MiniLM-L6-v2 initialized successfully (worker thread).');
             } else if (msg.type === 'init_error') {
                 console.warn('[Embedder Warning] Worker failed to initialize:', msg.error);
