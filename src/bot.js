@@ -15,7 +15,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Cognitive and Text Models
 const PRIMARY_MODEL = "deepseek/deepseek-v4-flash-0731";
 const FALLBACK_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free";
-const SOCIAL_MODEL = "nvidia/nemotron-3-super-120b-a12b:free";
+const SOCIAL_MODEL = "openai/gpt-oss-20b:free";
 
 // OpenRouter's free-model catalog rotates constantly. These two slugs were confirmed, live as of September 2026, but verify at https://openrouter.ai/models before deploying.
 
@@ -39,6 +39,7 @@ const REFLECTION_TIMER_CHECK_MS = 30 * 60 * 1000; // background check for quiet 
 const MAX_ACTIVE_BELIEFS = 25;
 const MAX_ACTIVE_GOALS = 5;
 
+// Long-term memory retrieval tuning
 const MEMORY_CANDIDATE_COUNT = 15; // fetched from pgvector before reranking
 const MEMORY_SIMILARITY_FLOOR = 0.35;
 const MEMORY_CONFIDENCE_FLOOR = 0.3;
@@ -55,8 +56,8 @@ const MAX_RAPPORT_CHANGE_PER_REFLECTION = 0.08;
 
 
 const BELIEF_MATCH_THRESHOLD = 0.83; // cosine similarity to treat a new statement as "the same belief"
-const BELIEF_LEARNING_RATE = 0.18; // reinforcement, how far confidence moves toward 1
-const BELIEF_DECAY_RATE = 0.15; // weakening,, how far confidence moves toward 0
+const BELIEF_LEARNING_RATE = 0.18; // reinforcement: how far confidence moves toward 1
+const BELIEF_DECAY_RATE = 0.15; // weakening: how far confidence moves toward 0
 const BELIEF_NEW_STARTING_CONFIDENCE = 0.45;
 const BELIEF_PASSIVE_DECAY = 0.05; // per idle reflection cycle, for beliefs nobody reinforced or weakened
 const BELIEF_EVIDENCE_FADE_DECAY = 0.15; // stronger decay when most of a belief's evidence has faded
@@ -70,8 +71,13 @@ const MAJOR_REFLECTION_STALE_GOAL_DAYS = 21; // goals untouched this long get dr
 
 const THOUGHT_STREAM_CLEANUP_DAYS = 7; // consumed private thoughts older than this get purged
 const DIAGNOSTICS_RETENTION_DAYS = 30; // local telemetry used to tune constants against real usage
-const HISTORY_RETENTION_DAYS = 30; // raw local transcript purge, long-term memory in Supabase is the durable record
-
+const HISTORY_RETENTION_DAYS = 30; // raw local transcript purge -- long-term memory in Supabase is the durable record
+// If extraction has been broken for an extended stretch (a model outage, say), the normal purge
+// below now skips anything past a channel's extraction cursor rather than deleting it -- so an
+// outage doesn't silently lose content that was never processed. This is the backstop for that:
+// even never-extracted content doesn't accumulate forever, it just gets a much longer grace
+// period than normally-extracted content does, on the assumption a 3x-longer outage than the
+// standard retention window is already a bigger problem than this bot can route around.
 const HISTORY_HARD_RETENTION_DAYS = 90;
 const HISTORY_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // once a day
 
@@ -106,7 +112,7 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 let embedderWorker = null;
 let embedderReady = false;
 let embedderRestartAttempts = 0;
-const EMBEDDER_MAX_RESTART_ATTEMPTS = 5; 
+const EMBEDDER_MAX_RESTART_ATTEMPTS = 5; // after this many failures in a row, stop retrying until the process restarts
 const pendingEmbedRequests = new Map();
 let nextEmbedRequestId = 1;
 
@@ -120,7 +126,7 @@ function initEmbedder() {
         embedderWorker.on('message', (msg) => {
             if (msg.type === 'ready') {
                 embedderReady = true;
-                embedderRestartAttempts = 0; 
+                embedderRestartAttempts = 0; // healthy again -- reset the backoff counter
                 console.log('[Embedder] MiniLM-L6-v2 initialized successfully (worker thread).');
             } else if (msg.type === 'init_error') {
                 console.warn('[Embedder Warning] Worker failed to initialize:', msg.error);
@@ -632,7 +638,6 @@ const forgetCommand = new SlashCommandBuilder()
 // 4. CORE HELPERS
 
 
-
 function safeParseJSON(rawText) {
     if (!rawText) return null;
 
@@ -710,7 +715,7 @@ function getShortTermHistory(channelId) {
     const kept = [];
     let tokenTotal = 0;
     for (const m of batch) {
-        const t = estimateTokens(m.content) + 8; 
+        const t = estimateTokens(m.content) + 8; // small overhead for role/name framing
         if (kept.length > 0 && tokenTotal + t > SHORT_TERM_TOKEN_BUDGET) break;
         kept.push(m);
         tokenTotal += t;
@@ -957,7 +962,6 @@ Keep it objective, natural, and under 120 words.`
 // 6. LONG-TERM MEMORY: EXTRACTION, CONSOLIDATION + SEMANTIC RETRIEVAL
 
 
-
 async function mergeMemorySummaries(oldSummary, newSummary) {
     try {
         const raw = await callLLM(SOCIAL_MODEL, [
@@ -969,7 +973,6 @@ async function mergeMemorySummaries(oldSummary, newSummary) {
         return newSummary;
     }
 }
-
 
 
 
@@ -1002,7 +1005,8 @@ async function storeLongTermMemories(guildId, entries, nameToId = new Map()) {
                         summary: merged,
                         embedding: mergedEmbedding || embedding,
                         embedding_model: EMBEDDING_MODEL_VERSION,
-                        
+                        // A memory found via the id path might still have subject_id null from
+                        // before migration -- backfill it now that we know it, at no cost.
                         subject_id: subjectId || similar[0].subject_id || null,
                         importance: (() => {
                             const old = similar[0].importance ?? importance;
@@ -1051,7 +1055,7 @@ async function runMemoryExtraction(guildId, channelId) {
         ORDER BY id ASC LIMIT ?
     `).all(guildId, channelId, cursor, SHORT_TERM_MAX_MESSAGES);
 
-    
+   
     if (recent.length === 0) {
         db.prepare(`UPDATE scheduler_state SET since_extraction = 0 WHERE guild_id = ? AND channel_id = ?`).run(guildId, channelId);
         return true;
@@ -1104,7 +1108,6 @@ Only include long_term entries worth remembering permanently. Only include worki
         const parsed = safeParseJSON(raw);
         if (!parsed) {
             logDiagnostic(guildId, channelId, 'extraction_result', { parseFailed: true });
-            
             return false;
         }
 
@@ -1140,7 +1143,6 @@ Only include long_term entries worth remembering permanently. Only include worki
         return true;
     } catch (err) {
         console.error('[Memory Extraction Error]', err.message);
-        
         return false;
     }
 }
@@ -1165,7 +1167,6 @@ Only include something if the image plausibly reveals a durable fact about the p
         const raw = await callLLM(SOCIAL_MODEL, prompt, true, 'low');
         const parsed = safeParseJSON(raw);
         if (parsed && Array.isArray(parsed.long_term) && parsed.long_term.length > 0) {
-            
             const nameToId = userId ? new Map([[userName.toLowerCase(), userId]]) : new Map();
             await storeLongTermMemories(guildId, parsed.long_term, nameToId);
         }
@@ -1204,7 +1205,6 @@ async function retrieveRelevantMemories(guildId, queryText, maxReturn = MEMORY_M
                 .in('status', ['active', 'fading'])
                 .order('created_at', { ascending: false })
                 .limit(maxReturn);
-            
             logDiagnostic(guildId, null, 'memory_retrieval', {
                 candidateCount: 0,
                 returnedCount: (data || []).length,
@@ -1227,7 +1227,8 @@ async function retrieveRelevantMemories(guildId, queryText, maxReturn = MEMORY_M
             const accessScore = Math.min(1, Math.log(1 + (m.access_count || 0)) / Math.log(11));
             let blended = 0.5 * m.similarity + 0.25 * (m.importance ?? 0.5) + 0.15 * recencyScore + 0.10 * accessScore;
             if (m.nature === 'event') blended = Math.min(1, blended + EVENT_RETRIEVAL_BOOST);
-            
+            // Prefer matching by the stable id when both sides have one; a nickname change would
+            // otherwise silently stop this boost from firing for that person's own memories.
             const isSpeakerSubject = m.subject_id && speakerId
                 ? m.subject_id === speakerId
                 : Boolean(speakerName && m.subject && m.subject.toLowerCase() === speakerName.toLowerCase());
@@ -1338,13 +1339,11 @@ async function applyBeliefUpdates(guildId, currentBeliefs, updates, nameToId = n
         if (embedding) {
             for (const b of existing) {
                 if (b.scope !== scope || !b._embedding) continue;
-                
                 const subjectMatches = (subjectId && b.subject_id)
                     ? b.subject_id === subjectId
                     : (b.subject || null) === subject;
                 if (!subjectMatches) continue;
                 const sim = cosineSimilarity(embedding, b._embedding);
-                
                 if (sim > bestSim && !hasNegationMismatch(u.statement, b.statement)) { bestSim = sim; best = b; }
             }
         }
@@ -1357,7 +1356,7 @@ async function applyBeliefUpdates(guildId, currentBeliefs, updates, nameToId = n
                 newConfidence = best.confidence + (1 - best.confidence) * BELIEF_LEARNING_RATE;
             }
             await supabase.from('beliefs').update({
-                statement: u.statement, 
+                statement: u.statement, // keep the freshest phrasing
                 confidence: clamp01(newConfidence),
                 evidence_count: (best.evidence_count || 1) + 1,
                 embedding,
@@ -1421,10 +1420,9 @@ async function passivelyDecayBeliefs(guildId, currentBeliefs, touchedIds) {
     }
 }
 
-// Deep, infrequent reflection pass: lets memories decay, then asks Akari to reinforce/weaken/add beliefs (durable impressions about people/the server/herself), revise active goals, and update per user profile + rapport, based on what's happened recently. Unlike memory extraction (raw fact capture)
 
 async function runReflectionCycle(guildId, channelId) {
-    if (!supabase) return true; // never configured -- retrying this every cycle forever would be pointless
+    if (!supabase) return true; 
     console.log(`[Reflection] Starting reflection cycle for guild ${guildId}...`);
 
     try {
@@ -1506,7 +1504,7 @@ Output strict JSON:
                 const existing = byText.get(normalize(g.goal));
 
                 if (action === 'complete' || action === 'drop') {
-                  
+                    
                     if (existing) idsToRemove.push(existing.id);
                     continue;
                 }
@@ -1521,7 +1519,8 @@ Output strict JSON:
                 });
                 if (existing) idsToRemove.push(existing.id); 
             }
-           
+            
+
             try {
                 if (idsToRemove.length > 0) {
                     await supabase.from('goals').delete().in('id', idsToRemove);
@@ -1550,7 +1549,7 @@ Output strict JSON:
                 const conflictTarget = userId ? 'guild_id,user_id' : 'guild_id,user_name';
 
                 if (userId) {
-                   
+                    
                     await supabase.from('user_profiles').update({ user_id: userId })
                         .eq('guild_id', guildId).eq('user_name', u.user_name).is('user_id', null);
                     await supabase.from('relationship_state').update({ user_id: userId })
@@ -1581,7 +1580,7 @@ Output strict JSON:
                     }, { onConflict: conflictTarget });
                 }
 
-                
+               
                 const existingRapport = await fetchIdentityLinkedRow('relationship_state', guildId, userId, u.user_name, 'rapport, updated_at');
                 const currentRapport = existingRapport ? decayRapport(existingRapport.rapport, existingRapport.updated_at) : RAPPORT_BASELINE;
                 const proposedRapport = clamp01(u.rapport ?? RAPPORT_BASELINE);
@@ -1624,7 +1623,6 @@ Output strict JSON:
         return true;
     } catch (err) {
         console.error('[Reflection Error]', err.message);
-        
         return false;
     }
 }
@@ -1641,10 +1639,16 @@ async function dedupBeliefs(guildId) {
         if (toDelete.has(parsed[i].id)) continue;
         for (let j = i + 1; j < parsed.length; j++) {
             if (toDelete.has(parsed[j].id)) continue;
-            if (parsed[i].scope !== parsed[j].scope || (parsed[i].subject || null) !== (parsed[j].subject || null)) continue;
+            
+            const subjectMatches = (parsed[i].subject_id && parsed[j].subject_id)
+                ? parsed[i].subject_id === parsed[j].subject_id
+                : (parsed[i].subject || null) === (parsed[j].subject || null);
+            if (parsed[i].scope !== parsed[j].scope || !subjectMatches) continue;
 
             const sim = cosineSimilarity(parsed[i]._embedding, parsed[j]._embedding);
             if (sim < BELIEF_MATCH_THRESHOLD) continue;
+            
+            if (hasNegationMismatch(parsed[i].statement, parsed[j].statement)) continue;
 
             const survivor = parsed[i].confidence >= parsed[j].confidence ? parsed[i] : parsed[j];
             const dupe = survivor === parsed[i] ? parsed[j] : parsed[i];
@@ -1914,6 +1918,7 @@ function buildSocialContextString(activeThread) {
 
 
 
+
 async function fetchIdentityLinkedRow(table, guildId, userId, userName, selectCols) {
     if (userId) {
         const { data } = await supabase.from(table).select(selectCols)
@@ -1945,7 +1950,6 @@ async function getCognitiveCore(guildId, userId, userName, userPrompt) {
 
     let memoryStr = "";
     if (memories.length > 0) {
-        
         memoryStr = "\n\n# Long-Term Memories:\n" + memories.map(m => {
             const hedge = (m.status === 'fading' || (m.confidence ?? 1) < 0.5) ? ' (this one feels uncertain, half-remembered)' : '';
             return m.nature === 'event' ? `- You recall: ${m.summary}${hedge}` : `- [${m.nature}] ${m.summary}${hedge}`;
@@ -1953,8 +1957,6 @@ async function getCognitiveCore(guildId, userId, userName, userPrompt) {
     }
 
     let beliefStr = "";
-    
-    
     const relevantBeliefs = (beliefsRes.data || []).filter(b =>
         b.scope !== 'user' || (
             (b.subject_id && userId) ? b.subject_id === userId
@@ -2000,6 +2002,7 @@ async function forgetUser(guildId, userId, displayName, scope) {
         .eq('guild_id', guildId).is('subject_id', null).ilike('subject', escapedName).select('id');
     const memoryCount = (memById?.length || 0) + (memByName?.length || 0);
 
+    // belief_evidence rows cascade automatically (on delete cascade, see schema.sql)
     const { data: beliefById } = await supabase.from('beliefs').delete()
         .eq('guild_id', guildId).eq('scope', 'user').eq('subject_id', userId).select('id');
     const { data: beliefByName } = await supabase.from('beliefs').delete()
@@ -2010,13 +2013,22 @@ async function forgetUser(guildId, userId, displayName, scope) {
         .eq('guild_id', guildId).eq('user_id', userId).select('user_name');
     const { data: profByName } = await supabase.from('user_profiles').delete()
         .eq('guild_id', guildId).is('user_id', null).ilike('user_name', escapedName).select('user_name');
-    const profileCount = (profById?.length || 0) + (profByName?.length || 0);
+    let profileCount = (profById?.length || 0) + (profByName?.length || 0);
 
     const { data: rapById } = await supabase.from('relationship_state').delete()
         .eq('guild_id', guildId).eq('user_id', userId).select('user_name');
     const { data: rapByName } = await supabase.from('relationship_state').delete()
         .eq('guild_id', guildId).is('user_id', null).ilike('user_name', escapedName).select('user_name');
-    const rapportCount = (rapById?.length || 0) + (rapByName?.length || 0);
+    let rapportCount = (rapById?.length || 0) + (rapByName?.length || 0);
+
+   
+    for (const [table, counter] of [['user_profiles', () => profileCount++], ['relationship_state', () => rapportCount++]]) {
+        const legacy = await findFragmentedLegacyRow(table, guildId, userId, displayName);
+        if (legacy) {
+            await supabase.from(table).delete().eq('guild_id', guildId).eq('user_name', legacy.user_name);
+            counter();
+        }
+    }
 
     let historyCount = 0;
     if (scope === 'everything') {
@@ -2061,7 +2073,6 @@ async function buildStatsReport(guildId) {
     const mentionCount = social.filter(s => s.isExplicitMention).length;
     const threadTriggerCount = social.filter(s => !s.isExplicitMention && s.shouldReply).length;
     const replyCount = social.filter(s => s.shouldReply).length;
-   
     const freshSocialCalls = social.filter(s => s.freshSocialBrainCall === true);
 
     const lines = [
@@ -2143,14 +2154,17 @@ function runScheduledJobs(guildId, channelId) {
         FROM scheduler_state WHERE guild_id = ? AND channel_id = ?
     `).get(guildId, channelId);
 
+    // Fast/cheap: raw fact + working memory capture, plus the occasional private thought
     if (state.since_extraction >= EXTRACTION_INTERVAL) {
         tryRunCognitiveJob(guildId, channelId, () => runMemoryExtraction(guildId, channelId));
     }
 
+    // Moderate/deep: belief/goal/profile/rapport reflection + memory decay
     if (state.since_reflection >= REFLECTION_MESSAGE_INTERVAL) {
         tryRunCognitiveJob(guildId, channelId, () => runReflectionCycle(guildId, channelId));
     }
 
+    // Rare/expensive: belief dedup + "who is Akari becoming" self-reflection
     if (state.since_major_reflection >= MAJOR_REFLECTION_MESSAGE_INTERVAL) {
         tryRunCognitiveJob(guildId, channelId, () => runMajorReflectionCycle(guildId, channelId));
     }
@@ -2252,7 +2266,6 @@ client.on('messageCreate', async (message) => {
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             `).run(guildId, message.channel.id, message.author.id, userName, 'user', fullMessageContent, JSON.stringify(imageUrls));
 
-            
             runScheduledJobs(guildId, message.channel.id);
 
             
@@ -2270,7 +2283,7 @@ client.on('messageCreate', async (message) => {
             } else {
                 threads = getLocalThreadsBestEffort(guildId, message.channel.id);
             }
-           
+            
             const speakerThreads = threads.filter(t =>
                 t.participants.some(p => p.toLowerCase() === userName.toLowerCase())
             );
@@ -2278,7 +2291,7 @@ client.on('messageCreate', async (message) => {
                 (t.expected_next_speaker || '').toLowerCase() === 'akari'
             ) || speakerThreads[0];
 
-          
+            
             const shouldReply = isExplicitMention || (
                 activeThread &&
                 (activeThread.expected_next_speaker || '').toLowerCase() === 'akari' &&
@@ -2314,7 +2327,7 @@ client.on('messageCreate', async (message) => {
                 ];
 
                 for (const m of pastMessages) {
-             
+                    
                     formattedMessages.push({
                         role: m.role === 'user' ? 'user' : 'assistant',
                         content: m.role === 'user' ? `${m.user_name}: ${sanitizeContentForTranscript(m.content)}` : m.content
@@ -2346,14 +2359,34 @@ client.on('messageCreate', async (message) => {
 
 // Client Ready Event
 client.once('clientReady', async () => {
-    console.log(`[Success] Akari 9.5 Cognitive Engine online as ${client.user.tag}`);
+    console.log(`[Success] Akari 10.0 Cognitive Engine online as ${client.user.tag}`);
     try {
         await client.application.commands.set([setupCommand, disableCommand, statsCommand, forgetCommand]);
     } catch (err) {
         console.error('[Slash Command Error]', err.message);
     }
     await initEmbedder();
+    await checkEmbeddingModelDrift();
 });
+
+
+async function checkEmbeddingModelDrift() {
+    if (!supabase) return;
+    try {
+        const [{ data: memRows }, { data: beliefRows }] = await Promise.all([
+            supabase.from('long_term_memory').select('embedding_model').not('embedding_model', 'is', null).limit(1000),
+            supabase.from('beliefs').select('embedding_model').not('embedding_model', 'is', null).limit(1000)
+        ]);
+        const seen = new Set([...(memRows || []), ...(beliefRows || [])].map(r => r.embedding_model).filter(Boolean));
+        seen.delete(EMBEDDING_MODEL_VERSION);
+        if (seen.size > 0) {
+            console.warn(`[Embedder Warning] Found vectors stored under a different embedding_model than the current one (${EMBEDDING_MODEL_VERSION}): ${[...seen].join(', ')}.`);
+            console.warn('[Embedder Warning] Cosine similarity between vectors from different models is not meaningful -- consolidation, retrieval, and belief-matching involving these rows may silently misbehave until they are re-embedded.');
+        }
+    } catch (err) {
+        console.warn('[Embedder Warning] Could not check for embedding model drift:', err.message);
+    }
+}
 
 
 // 11. BACKGROUND SCHEDULERS
@@ -2364,14 +2397,15 @@ if (supabase) {
         for (const cfg of configs) {
             const log = db.prepare(`SELECT last_reflection_at FROM reflection_log WHERE guild_id = ? AND channel_id = ?`).get(cfg.guild_id, cfg.channel_id);
             const lastMsg = db.prepare(`SELECT timestamp FROM history WHERE guild_id = ? AND channel_id = ? ORDER BY id DESC LIMIT 1`).get(cfg.guild_id, cfg.channel_id);
-            if (!lastMsg) continue; 
+            if (!lastMsg) continue; // nothing has ever been said here yet
+
             const lastReflectionAt = log ? parseSqliteTimestamp(log.last_reflection_at) : null;
             const lastMessageAt = parseSqliteTimestamp(lastMsg.timestamp);
             const minutesSinceReflection = lastReflectionAt ? (Date.now() - lastReflectionAt.getTime()) / 60000 : Infinity;
             const alreadyReflectedOnLatest = lastReflectionAt && lastReflectionAt.getTime() > lastMessageAt.getTime();
 
             if (minutesSinceReflection >= REFLECTION_MIN_INTERVAL_MINUTES && !alreadyReflectedOnLatest) {
-           
+                
                 tryRunCognitiveJob(cfg.guild_id, cfg.channel_id, () => runReflectionCycle(cfg.guild_id, cfg.channel_id));
             }
         }
