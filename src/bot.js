@@ -12,11 +12,12 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // 1. MODEL CONFIGURATIONS AND CONSTANTS
 
 
+// Cognitive and Text Models
 const PRIMARY_MODEL = "deepseek/deepseek-v4-flash-0731";
 const FALLBACK_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free";
 const SOCIAL_MODEL = "nvidia/nemotron-3-super-120b-a12b:free";
 
-// OpenRouter's free-model catalog rotates constantly. These slugs were confirmed live as of September 2026, but verify at https://openrouter.ai/models before deploying
+// OpenRouter's free-model catalog rotates constantly. These two slugs were confirmed, live as of September 2026, but verify at https://openrouter.ai/models before deploying.
 
 const PRIMARY_VISION_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free";
 const FALLBACK_VISION_MODEL = "google/gemma-4-31b-it:free";
@@ -29,10 +30,8 @@ const SHORT_TERM_TOKEN_BUDGET = 9000;
 const SHORT_TERM_MAX_MESSAGES = 80;
 
 
-
 const EXTRACTION_INTERVAL = 10;
 const WORKING_MEMORY_TTL_MINUTES = 30;
-
 
 const REFLECTION_MESSAGE_INTERVAL = 150;
 const REFLECTION_MIN_INTERVAL_MINUTES = 180;
@@ -40,13 +39,13 @@ const REFLECTION_TIMER_CHECK_MS = 30 * 60 * 1000; // background check for quiet 
 const MAX_ACTIVE_BELIEFS = 25;
 const MAX_ACTIVE_GOALS = 5;
 
-
 const MEMORY_CANDIDATE_COUNT = 15; // fetched from pgvector before reranking
 const MEMORY_SIMILARITY_FLOOR = 0.35;
 const MEMORY_CONFIDENCE_FLOOR = 0.3;
 const MEMORY_MAX_RETURN = 8;
 const CONSOLIDATION_SIMILARITY_THRESHOLD = 0.86;
 
+const MEMORY_MERGE_LEARNING_RATE = 0.18;
 
 
 const RAPPORT_BASELINE = 0.5;
@@ -57,7 +56,7 @@ const MAX_RAPPORT_CHANGE_PER_REFLECTION = 0.08;
 
 const BELIEF_MATCH_THRESHOLD = 0.83; // cosine similarity to treat a new statement as "the same belief"
 const BELIEF_LEARNING_RATE = 0.18; // reinforcement, how far confidence moves toward 1
-const BELIEF_DECAY_RATE = 0.15; // weakening, how far confidence moves toward 0
+const BELIEF_DECAY_RATE = 0.15; // weakening,, how far confidence moves toward 0
 const BELIEF_NEW_STARTING_CONFIDENCE = 0.45;
 const BELIEF_PASSIVE_DECAY = 0.05; // per idle reflection cycle, for beliefs nobody reinforced or weakened
 const BELIEF_EVIDENCE_FADE_DECAY = 0.15; // stronger decay when most of a belief's evidence has faded
@@ -66,15 +65,15 @@ const BELIEF_PRUNE_THRESHOLD = 0.15; // beliefs below this confidence get droppe
 const EVENT_RETRIEVAL_BOOST = 0.08; // episodic memories surface slightly more readily than plain facts
 const SPEAKER_SUBJECT_BOOST = 0.06; // memories about whoever is currently speaking surface slightly more readily
 
-
 const MAJOR_REFLECTION_MESSAGE_INTERVAL = 1200;
 const MAJOR_REFLECTION_STALE_GOAL_DAYS = 21; // goals untouched this long get dropped as stale
 
 const THOUGHT_STREAM_CLEANUP_DAYS = 7; // consumed private thoughts older than this get purged
 const DIAGNOSTICS_RETENTION_DAYS = 30; // local telemetry used to tune constants against real usage
 const HISTORY_RETENTION_DAYS = 30; // raw local transcript purge, long-term memory in Supabase is the durable record
-const HISTORY_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // once a day
 
+const HISTORY_HARD_RETENTION_DAYS = 90;
+const HISTORY_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // once a day
 
 const SOCIAL_BRAIN_MIN_INTERVAL_MS = 3000;
 
@@ -107,7 +106,7 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 let embedderWorker = null;
 let embedderReady = false;
 let embedderRestartAttempts = 0;
-const EMBEDDER_MAX_RESTART_ATTEMPTS = 5;
+const EMBEDDER_MAX_RESTART_ATTEMPTS = 5; 
 const pendingEmbedRequests = new Map();
 let nextEmbedRequestId = 1;
 
@@ -167,7 +166,6 @@ function scheduleEmbedderRestart() {
 }
 
 
-
 async function embedText(text) {
     if (!embedderReady || !embedderWorker || !text) return null;
     const id = nextEmbedRequestId++;
@@ -185,7 +183,6 @@ async function embedText(text) {
         }, 10000);
     });
 }
-
 
 const db = new DatabaseSync('./local_shortterm.db');
 
@@ -267,7 +264,6 @@ db.exec(`
 `);
 
 
-
 function logDiagnostic(guildId, channelId, eventType, payload) {
     try {
         db.prepare(`INSERT INTO diagnostics_log (guild_id, channel_id, event_type, payload) VALUES (?, ?, ?, ?)`)
@@ -276,7 +272,6 @@ function logDiagnostic(guildId, channelId, eventType, payload) {
         console.warn('[Diagnostics] Failed to log:', err.message);
     }
 }
-
 
 let supabase = null;
 if (SUPABASE_URL && SUPABASE_KEY) {
@@ -616,7 +611,26 @@ const statsCommand = new SlashCommandBuilder()
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
 
 
+const forgetCommand = new SlashCommandBuilder()
+    .setName('forget')
+    .setDescription("Erase what Akari has learned about a person in this server")
+    .addStringOption(opt => opt.setName('scope')
+        .setDescription('What to erase')
+        .setRequired(true)
+        .addChoices(
+            { name: 'Learned data (memories, beliefs, profile, rapport)', value: 'learned' },
+            { name: 'Everything, including recent raw message history', value: 'everything' }
+        ))
+    .addBooleanOption(opt => opt.setName('confirm')
+        .setDescription('Yes, I understand this cannot be undone')
+        .setRequired(true))
+    .addUserOption(opt => opt.setName('user')
+        .setDescription('Erase for someone else instead of yourself (requires Manage Server)')
+        .setRequired(false));
+
+
 // 4. CORE HELPERS
+
 
 
 function safeParseJSON(rawText) {
@@ -644,6 +658,7 @@ function safeParseJSON(rawText) {
 }
 
 
+
 function escapeLikePattern(str) {
     return (str || '').replace(/[%_\\]/g, ch => '\\' + ch);
 }
@@ -652,12 +667,10 @@ function clamp01(n) {
     return Math.max(0, Math.min(1, Number.isFinite(n) ? n : 0.5));
 }
 
-
 function parseSqliteTimestamp(str) {
     if (!str) return null;
     return new Date(str.replace(' ', 'T') + 'Z');
 }
-
 
 function estimateTokens(text) {
     return Math.ceil((text || '').length / 4);
@@ -673,6 +686,13 @@ function cosineSimilarity(a, b) {
     }
     if (normA === 0 || normB === 0) return 0;
     return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
+
+const NEGATION_CUES = /\b(not|n't|no longer|never|stopped|quit|doesn't|don't|didn't|isn't|wasn't|won't|wouldn't|cannot|can't|hasn't|haven't|hadn't|used to)\b/i;
+
+function hasNegationMismatch(textA, textB) {
+    return NEGATION_CUES.test(textA || '') !== NEGATION_CUES.test(textB || '');
 }
 
 function parseEmbedding(raw) {
@@ -698,6 +718,7 @@ function getShortTermHistory(channelId) {
     return kept.reverse();
 }
 
+
 function buildNameIdMap(rows) {
     const map = new Map();
     for (const r of rows) {
@@ -705,6 +726,44 @@ function buildNameIdMap(rows) {
         map.set(r.user_name.toLowerCase(), r.user_id);
     }
     return map;
+}
+
+
+function resolveUserIdByNameFromHistory(guildId, name) {
+    if (!name) return null;
+    const row = db.prepare(`
+        SELECT user_id, COUNT(*) as n, MAX(id) as last_id
+        FROM history
+        WHERE guild_id = ? AND role = 'user' AND LOWER(user_name) = LOWER(?) AND user_id IS NOT NULL
+        GROUP BY user_id
+        ORDER BY n DESC, last_id DESC
+        LIMIT 1
+    `).get(guildId, name);
+    return row?.user_id || null;
+}
+
+
+async function findFragmentedLegacyRow(table, guildId, userId, currentName) {
+    const { data: candidates, error } = await supabase.from(table)
+        .select('user_name, updated_at')
+        .eq('guild_id', guildId)
+        .is('user_id', null)
+        .neq('user_name', currentName);
+    if (error || !candidates || candidates.length === 0) return null;
+
+    const matches = candidates.filter(row => resolveUserIdByNameFromHistory(guildId, row.user_name) === userId);
+    if (matches.length === 0) return null;
+
+    matches.sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at));
+    const [survivor, ...duplicates] = matches;
+
+    if (duplicates.length > 0) {
+        console.log(`[Identity] Merging ${duplicates.length} duplicate ${table} row(s) for the same person as "${survivor.user_name}" in guild ${guildId}.`);
+        await supabase.from(table).delete()
+            .eq('guild_id', guildId)
+            .in('user_name', duplicates.map(d => d.user_name));
+    }
+    return survivor;
 }
 
  
@@ -728,7 +787,6 @@ function chunkForDiscord(text, maxLen = DISCORD_MAX_MESSAGE_LENGTH) {
 }
 
 
-
 async function sendChunkedReply(message, text) {
     const chunks = chunkForDiscord(text);
     for (let i = 0; i < chunks.length; i++) {
@@ -748,7 +806,6 @@ function startTypingKeepAlive(channel) {
     }, 8000);
     return () => clearInterval(interval);
 }
-
 
 
 const channelLocks = new Map();
@@ -784,6 +841,11 @@ function sanitizeDisplayName(rawName) {
 }
 
 
+function sanitizeContentForTranscript(content) {
+    return (content || '').replace(/\r\n|\r|\n/g, ' \\n ');
+}
+
+
 
 async function callLLM(model, apiMessages, jsonMode = false, reasoningEffort = null) {
     const payload = { model, messages: apiMessages, temperature: 0.7, max_tokens: 1500 };
@@ -814,9 +876,21 @@ async function callLLM(model, apiMessages, jsonMode = false, reasoningEffort = n
 
 // 5. DEDICATED VISION PERCEPTION PIPELINE
 
- 
+
+const VISION_REQUEST_TIMEOUT_MS = 12000;
+const VISION_CIRCUIT_FAILURE_THRESHOLD = 3;
+const VISION_CIRCUIT_BASE_COOLDOWN_MS = 2 * 60 * 1000;
+const VISION_CIRCUIT_MAX_COOLDOWN_MS = 20 * 60 * 1000;
+let visionConsecutiveFailures = 0;
+let visionCircuitOpenUntil = 0;
+
 async function analyzeImages(imageUrls) {
     if (!imageUrls || imageUrls.length === 0) return null;
+
+    if (Date.now() < visionCircuitOpenUntil) {
+        console.warn('[Vision Pipeline] Circuit open (recent repeated failures) -- skipping the call, using the placeholder.');
+        return "(Akari attempted to look at the image, but couldn't load it clearly.)";
+    }
 
     const visionMessages = [
         {
@@ -848,7 +922,7 @@ Keep it objective, natural, and under 120 words.`
                 "Authorization": `Bearer ${OPENROUTER_KEY}`,
                 "Content-Type": "application/json"
             },
-            timeout: 12000
+            timeout: VISION_REQUEST_TIMEOUT_MS
         });
 
         return res.data.choices[0].message.content;
@@ -856,14 +930,24 @@ Keep it objective, natural, and under 120 words.`
 
     try {
         console.log(`[Vision Pipeline] Analyzing ${imageUrls.length} image(s) via ${PRIMARY_VISION_MODEL}...`);
-        return await tryVisionCall(PRIMARY_VISION_MODEL);
+        const result = await tryVisionCall(PRIMARY_VISION_MODEL);
+        visionConsecutiveFailures = 0;
+        return result;
     } catch (err) {
         console.warn(`[Vision Pipeline] Primary (${PRIMARY_VISION_MODEL}) failed. Trying fallback (${FALLBACK_VISION_MODEL})...`);
         logDiagnostic(null, null, 'vision_fallback', { primary: PRIMARY_VISION_MODEL, fallback: FALLBACK_VISION_MODEL });
         try {
-            return await tryVisionCall(FALLBACK_VISION_MODEL);
+            const result = await tryVisionCall(FALLBACK_VISION_MODEL);
+            visionConsecutiveFailures = 0;
+            return result;
         } catch (fallbackErr) {
             console.error(`[Vision Pipeline Error] Fallback vision failed: ${fallbackErr.message}`);
+            visionConsecutiveFailures++;
+            if (visionConsecutiveFailures >= VISION_CIRCUIT_FAILURE_THRESHOLD) {
+                const cooldown = Math.min(VISION_CIRCUIT_MAX_COOLDOWN_MS, VISION_CIRCUIT_BASE_COOLDOWN_MS * Math.pow(2, visionConsecutiveFailures - VISION_CIRCUIT_FAILURE_THRESHOLD));
+                visionCircuitOpenUntil = Date.now() + cooldown;
+                console.warn(`[Vision Pipeline] ${visionConsecutiveFailures} consecutive full failures -- opening circuit for ${Math.round(cooldown / 1000)}s.`);
+            }
             return "(Akari attempted to look at the image, but couldn't load it clearly.)";
         }
     }
@@ -871,6 +955,7 @@ Keep it objective, natural, and under 120 words.`
 
 
 // 6. LONG-TERM MEMORY: EXTRACTION, CONSOLIDATION + SEMANTIC RETRIEVAL
+
 
 
 async function mergeMemorySummaries(oldSummary, newSummary) {
@@ -884,6 +969,7 @@ async function mergeMemorySummaries(oldSummary, newSummary) {
         return newSummary;
     }
 }
+
 
 
 
@@ -909,16 +995,19 @@ async function storeLongTermMemories(guildId, entries, nameToId = new Map()) {
                     similarity_threshold: CONSOLIDATION_SIMILARITY_THRESHOLD
                 });
 
-                if (similar && similar.length > 0) {
+                if (similar && similar.length > 0 && !hasNegationMismatch(similar[0].summary, entry.summary)) {
                     const merged = await mergeMemorySummaries(similar[0].summary, entry.summary);
                     const mergedEmbedding = await embedText(merged);
                     await supabase.from('long_term_memory').update({
                         summary: merged,
                         embedding: mergedEmbedding || embedding,
                         embedding_model: EMBEDDING_MODEL_VERSION,
-
+                        
                         subject_id: subjectId || similar[0].subject_id || null,
-                        importance: Math.min(1, (similar[0].importance ?? importance) + 0.08),
+                        importance: (() => {
+                            const old = similar[0].importance ?? importance;
+                            return clamp01(old + (1 - old) * MEMORY_MERGE_LEARNING_RATE);
+                        })(),
                         evidence_count: (similar[0].evidence_count ?? 1) + 1,
                         status: 'active',
                         last_accessed: new Date().toISOString()
@@ -962,7 +1051,7 @@ async function runMemoryExtraction(guildId, channelId) {
         ORDER BY id ASC LIMIT ?
     `).all(guildId, channelId, cursor, SHORT_TERM_MAX_MESSAGES);
 
-
+    
     if (recent.length === 0) {
         db.prepare(`UPDATE scheduler_state SET since_extraction = 0 WHERE guild_id = ? AND channel_id = ?`).run(guildId, channelId);
         return true;
@@ -970,7 +1059,7 @@ async function runMemoryExtraction(guildId, channelId) {
 
     const nameToId = buildNameIdMap(recent);
 
-
+    
     const advanceCursor = () => {
         const maxId = recent[recent.length - 1].id;
         db.prepare(`
@@ -980,7 +1069,7 @@ async function runMemoryExtraction(guildId, channelId) {
         `).run(guildId, channelId, maxId);
     };
 
-    const transcript = recent.map(h => `${h.role === 'user' ? h.user_name : 'AKARI'}: ${h.content}`).join('\n');
+    const transcript = recent.map(h => `${h.role === 'user' ? h.user_name : 'AKARI'}: ${sanitizeContentForTranscript(h.content)}`).join('\n');
 
     const extractionPrompt = [
         {
@@ -1015,7 +1104,7 @@ Only include long_term entries worth remembering permanently. Only include worki
         const parsed = safeParseJSON(raw);
         if (!parsed) {
             logDiagnostic(guildId, channelId, 'extraction_result', { parseFailed: true });
-
+            
             return false;
         }
 
@@ -1051,11 +1140,10 @@ Only include long_term entries worth remembering permanently. Only include worki
         return true;
     } catch (err) {
         console.error('[Memory Extraction Error]', err.message);
-
+        
         return false;
     }
 }
-
 
 
 async function extractFromVision(guildId, userName, imageDescription, userId = null) {
@@ -1077,7 +1165,7 @@ Only include something if the image plausibly reveals a durable fact about the p
         const raw = await callLLM(SOCIAL_MODEL, prompt, true, 'low');
         const parsed = safeParseJSON(raw);
         if (parsed && Array.isArray(parsed.long_term) && parsed.long_term.length > 0) {
-
+            
             const nameToId = userId ? new Map([[userName.toLowerCase(), userId]]) : new Map();
             await storeLongTermMemories(guildId, parsed.long_term, nameToId);
         }
@@ -1116,7 +1204,7 @@ async function retrieveRelevantMemories(guildId, queryText, maxReturn = MEMORY_M
                 .in('status', ['active', 'fading'])
                 .order('created_at', { ascending: false })
                 .limit(maxReturn);
-
+            
             logDiagnostic(guildId, null, 'memory_retrieval', {
                 candidateCount: 0,
                 returnedCount: (data || []).length,
@@ -1139,7 +1227,7 @@ async function retrieveRelevantMemories(guildId, queryText, maxReturn = MEMORY_M
             const accessScore = Math.min(1, Math.log(1 + (m.access_count || 0)) / Math.log(11));
             let blended = 0.5 * m.similarity + 0.25 * (m.importance ?? 0.5) + 0.15 * recencyScore + 0.10 * accessScore;
             if (m.nature === 'event') blended = Math.min(1, blended + EVENT_RETRIEVAL_BOOST);
-
+            
             const isSpeakerSubject = m.subject_id && speakerId
                 ? m.subject_id === speakerId
                 : Boolean(speakerName && m.subject && m.subject.toLowerCase() === speakerName.toLowerCase());
@@ -1234,6 +1322,7 @@ async function linkBeliefEvidence(beliefId, memoryIds) {
 
 
 
+
 async function applyBeliefUpdates(guildId, currentBeliefs, updates, nameToId = new Map()) {
     const touched = new Set();
     const existing = currentBeliefs.map(b => ({ ...b, _embedding: parseEmbedding(b.embedding) }));
@@ -1249,13 +1338,14 @@ async function applyBeliefUpdates(guildId, currentBeliefs, updates, nameToId = n
         if (embedding) {
             for (const b of existing) {
                 if (b.scope !== scope || !b._embedding) continue;
-        
+                
                 const subjectMatches = (subjectId && b.subject_id)
                     ? b.subject_id === subjectId
                     : (b.subject || null) === subject;
                 if (!subjectMatches) continue;
                 const sim = cosineSimilarity(embedding, b._embedding);
-                if (sim > bestSim) { bestSim = sim; best = b; }
+                
+                if (sim > bestSim && !hasNegationMismatch(u.statement, b.statement)) { bestSim = sim; best = b; }
             }
         }
 
@@ -1264,23 +1354,20 @@ async function applyBeliefUpdates(guildId, currentBeliefs, updates, nameToId = n
             if (u.signal === 'weaken') {
                 newConfidence = best.confidence * (1 - BELIEF_DECAY_RATE);
             } else {
-               
                 newConfidence = best.confidence + (1 - best.confidence) * BELIEF_LEARNING_RATE;
             }
             await supabase.from('beliefs').update({
-                statement: u.statement,
+                statement: u.statement, 
                 confidence: clamp01(newConfidence),
                 evidence_count: (best.evidence_count || 1) + 1,
                 embedding,
                 embedding_model: EMBEDDING_MODEL_VERSION,
-              
                 subject_id: subjectId || best.subject_id || null,
                 last_updated: new Date().toISOString()
             }).eq('id', best.id);
             touched.add(best.id);
             await linkBeliefEvidence(best.id, u.evidence_memory_ids);
         } else if (u.signal !== 'weaken') {
-           
             const { data: inserted, error } = await supabase.from('beliefs').insert({
                 guild_id: guildId, scope, subject, subject_id: subjectId, statement: u.statement,
                 confidence: BELIEF_NEW_STARTING_CONFIDENCE, evidence_count: 1,
@@ -1334,9 +1421,10 @@ async function passivelyDecayBeliefs(guildId, currentBeliefs, touchedIds) {
     }
 }
 
+// Deep, infrequent reflection pass: lets memories decay, then asks Akari to reinforce/weaken/add beliefs (durable impressions about people/the server/herself), revise active goals, and update per user profile + rapport, based on what's happened recently. Unlike memory extraction (raw fact capture)
 
 async function runReflectionCycle(guildId, channelId) {
-    if (!supabase) return true; 
+    if (!supabase) return true; // never configured -- retrying this every cycle forever would be pointless
     console.log(`[Reflection] Starting reflection cycle for guild ${guildId}...`);
 
     try {
@@ -1345,8 +1433,8 @@ async function runReflectionCycle(guildId, channelId) {
         });
 
         const recentHistory = getShortTermHistory(channelId);
-        if (recentHistory.length === 0) return true; 
-        const transcript = recentHistory.map(h => `${h.role === 'user' ? h.user_name : 'AKARI'}: ${h.content}`).join('\n');
+        if (recentHistory.length === 0) return true; // nothing to reflect on right now, not a failure
+        const transcript = recentHistory.map(h => `${h.role === 'user' ? h.user_name : 'AKARI'}: ${sanitizeContentForTranscript(h.content)}`).join('\n');
         const nameToId = buildNameIdMap(recentHistory);
 
         const { data: currentBeliefs } = await supabase.from('beliefs').select('*').eq('guild_id', guildId);
@@ -1418,10 +1506,11 @@ Output strict JSON:
                 const existing = byText.get(normalize(g.goal));
 
                 if (action === 'complete' || action === 'drop') {
+                  
                     if (existing) idsToRemove.push(existing.id);
                     continue;
                 }
-                
+
                 rowsToInsert.push({
                     guild_id: guildId,
                     goal: g.goal,
@@ -1430,9 +1519,9 @@ Output strict JSON:
                     status: 'active',
                     last_updated: new Date().toISOString()
                 });
-                if (existing) idsToRemove.push(existing.id);
+                if (existing) idsToRemove.push(existing.id); 
             }
-
+           
             try {
                 if (idsToRemove.length > 0) {
                     await supabase.from('goals').delete().in('id', idsToRemove);
@@ -1441,6 +1530,7 @@ Output strict JSON:
                     const { error: insertError } = await supabase.from('goals').insert(rowsToInsert);
                     if (insertError) throw insertError;
                 }
+                
                 const { data: allGoals } = await supabase.from('goals')
                     .select('id, priority').eq('guild_id', guildId).eq('status', 'active')
                     .order('priority', { ascending: false });
@@ -1455,16 +1545,30 @@ Output strict JSON:
         if (Array.isArray(parsed.user_updates)) {
             for (const u of parsed.user_updates) {
                 if (!u.user_name) continue;
-
+               
                 const userId = nameToId.get(u.user_name.toLowerCase()) || null;
                 const conflictTarget = userId ? 'guild_id,user_id' : 'guild_id,user_name';
 
                 if (userId) {
-   
+                   
                     await supabase.from('user_profiles').update({ user_id: userId })
                         .eq('guild_id', guildId).eq('user_name', u.user_name).is('user_id', null);
                     await supabase.from('relationship_state').update({ user_id: userId })
                         .eq('guild_id', guildId).eq('user_name', u.user_name).is('user_id', null);
+
+                   
+                    for (const table of ['user_profiles', 'relationship_state']) {
+                        const { data: alreadyLinked } = await supabase.from(table)
+                            .select('user_name').eq('guild_id', guildId).eq('user_id', userId).maybeSingle();
+                        if (!alreadyLinked) {
+                            const legacy = await findFragmentedLegacyRow(table, guildId, userId, u.user_name);
+                            if (legacy) {
+                                await supabase.from(table)
+                                    .update({ user_id: userId, user_name: u.user_name })
+                                    .eq('guild_id', guildId).eq('user_name', legacy.user_name);
+                            }
+                        }
+                    }
                 }
 
                 if (u.profile_summary) {
@@ -1477,6 +1581,7 @@ Output strict JSON:
                     }, { onConflict: conflictTarget });
                 }
 
+                
                 const existingRapport = await fetchIdentityLinkedRow('relationship_state', guildId, userId, u.user_name, 'rapport, updated_at');
                 const currentRapport = existingRapport ? decayRapport(existingRapport.rapport, existingRapport.updated_at) : RAPPORT_BASELINE;
                 const proposedRapport = clamp01(u.rapport ?? RAPPORT_BASELINE);
@@ -1519,6 +1624,7 @@ Output strict JSON:
         return true;
     } catch (err) {
         console.error('[Reflection Error]', err.message);
+        
         return false;
     }
 }
@@ -1688,7 +1794,7 @@ async function updateConversationThreads(guildId, channelId) {
         FROM conversation_threads WHERE guild_id = ? AND channel_id = ?
     `).all(guildId, channelId);
 
-    const transcript = history.map(h => `${h.role === 'user' ? h.user_name : 'AKARI'}: ${h.content}`).join('\n');
+    const transcript = history.map(h => `${h.role === 'user' ? h.user_name : 'AKARI'}: ${sanitizeContentForTranscript(h.content)}`).join('\n');
 
     const socialPrompt = [
         {
@@ -1807,6 +1913,7 @@ function buildSocialContextString(activeThread) {
 }
 
 
+
 async function fetchIdentityLinkedRow(table, guildId, userId, userName, selectCols) {
     if (userId) {
         const { data } = await supabase.from(table).select(selectCols)
@@ -1838,7 +1945,7 @@ async function getCognitiveCore(guildId, userId, userName, userPrompt) {
 
     let memoryStr = "";
     if (memories.length > 0) {
-
+        
         memoryStr = "\n\n# Long-Term Memories:\n" + memories.map(m => {
             const hedge = (m.status === 'fading' || (m.confidence ?? 1) < 0.5) ? ' (this one feels uncertain, half-remembered)' : '';
             return m.nature === 'event' ? `- You recall: ${m.summary}${hedge}` : `- [${m.nature}] ${m.summary}${hedge}`;
@@ -1846,7 +1953,8 @@ async function getCognitiveCore(guildId, userId, userName, userPrompt) {
     }
 
     let beliefStr = "";
-
+    
+    
     const relevantBeliefs = (beliefsRes.data || []).filter(b =>
         b.scope !== 'user' || (
             (b.subject_id && userId) ? b.subject_id === userId
@@ -1878,6 +1986,55 @@ async function getCognitiveCore(guildId, userId, userName, userPrompt) {
 }
 
 
+async function forgetUser(guildId, userId, displayName, scope) {
+    if (!supabase) {
+        return `Akari's long-term memory isn't connected, so there's nothing stored in the cloud to erase for ${displayName}.` +
+            (scope === 'everything' ? '' : ' (Local message history is left alone for this scope.)');
+    }
+
+    const escapedName = escapeLikePattern(displayName);
+
+    const { data: memById } = await supabase.from('long_term_memory').delete()
+        .eq('guild_id', guildId).eq('subject_id', userId).select('id');
+    const { data: memByName } = await supabase.from('long_term_memory').delete()
+        .eq('guild_id', guildId).is('subject_id', null).ilike('subject', escapedName).select('id');
+    const memoryCount = (memById?.length || 0) + (memByName?.length || 0);
+
+    const { data: beliefById } = await supabase.from('beliefs').delete()
+        .eq('guild_id', guildId).eq('scope', 'user').eq('subject_id', userId).select('id');
+    const { data: beliefByName } = await supabase.from('beliefs').delete()
+        .eq('guild_id', guildId).eq('scope', 'user').is('subject_id', null).ilike('subject', escapedName).select('id');
+    const beliefCount = (beliefById?.length || 0) + (beliefByName?.length || 0);
+
+    const { data: profById } = await supabase.from('user_profiles').delete()
+        .eq('guild_id', guildId).eq('user_id', userId).select('user_name');
+    const { data: profByName } = await supabase.from('user_profiles').delete()
+        .eq('guild_id', guildId).is('user_id', null).ilike('user_name', escapedName).select('user_name');
+    const profileCount = (profById?.length || 0) + (profByName?.length || 0);
+
+    const { data: rapById } = await supabase.from('relationship_state').delete()
+        .eq('guild_id', guildId).eq('user_id', userId).select('user_name');
+    const { data: rapByName } = await supabase.from('relationship_state').delete()
+        .eq('guild_id', guildId).is('user_id', null).ilike('user_name', escapedName).select('user_name');
+    const rapportCount = (rapById?.length || 0) + (rapByName?.length || 0);
+
+    let historyCount = 0;
+    if (scope === 'everything') {
+        const result = db.prepare(`DELETE FROM history WHERE guild_id = ? AND user_id = ?`).run(guildId, userId);
+        historyCount = result.changes;
+    }
+
+    const parts = [];
+    if (memoryCount) parts.push(`${memoryCount} long-term memor${memoryCount === 1 ? 'y' : 'ies'}`);
+    if (beliefCount) parts.push(`${beliefCount} belief${beliefCount === 1 ? '' : 's'}`);
+    if (profileCount) parts.push('profile');
+    if (rapportCount) parts.push('rapport/relationship state');
+    if (historyCount) parts.push(`${historyCount} raw message${historyCount === 1 ? '' : 's'} from local history`);
+
+    if (parts.length === 0) return `Nothing found to erase for ${displayName} in this server.`;
+    return `Erased for ${displayName}: ${parts.join(', ')}. This cannot be undone.`;
+}
+
 async function buildStatsReport(guildId) {
     const parseRows = (eventType, limit = 5000) => db.prepare(`
         SELECT payload FROM diagnostics_log
@@ -1904,13 +2061,16 @@ async function buildStatsReport(guildId) {
     const mentionCount = social.filter(s => s.isExplicitMention).length;
     const threadTriggerCount = social.filter(s => !s.isExplicitMention && s.shouldReply).length;
     const replyCount = social.filter(s => s.shouldReply).length;
+   
+    const freshSocialCalls = social.filter(s => s.freshSocialBrainCall === true);
 
     const lines = [
         `**Akari Diagnostics** (last ${social.length} social decisions logged, ${totalMessages} messages seen total)`,
         ``,
         `**Social brain**`,
         `- Reply rate: ${pct(replyCount, social.length)} (${mentionCount} via mention, ${threadTriggerCount} via thread probability)`,
-        `- Avg thread reply_probability: ${avg(social.filter(s => !s.isExplicitMention), 'replyProbability')}`,
+        `- Fresh social-brain call rate: ${pct(freshSocialCalls.length, social.filter(s => !s.isExplicitMention).length)} (the rest reused the last cached thread state, rate-limited to one fresh call per ${SOCIAL_BRAIN_MIN_INTERVAL_MS / 1000}s per channel)`,
+        `- Avg thread reply_probability (fresh calls only): ${avg(freshSocialCalls, 'replyProbability')}`,
         ``,
         `**Main reply**`,
         `- Avg latency: ${mainReplies.length ? Math.round(mainReplies.reduce((a, r) => a + r.latencyMs, 0) / mainReplies.length) + 'ms' : 'n/a'} (n=${mainReplies.length})`,
@@ -1952,6 +2112,8 @@ async function buildStatsReport(guildId) {
     return lines.join('\n');
 }
 
+
+
 const cognitiveLocks = new Set();
 
 function tryRunCognitiveJob(guildId, channelId, fn) {
@@ -1981,16 +2143,13 @@ function runScheduledJobs(guildId, channelId) {
         FROM scheduler_state WHERE guild_id = ? AND channel_id = ?
     `).get(guildId, channelId);
 
-
     if (state.since_extraction >= EXTRACTION_INTERVAL) {
         tryRunCognitiveJob(guildId, channelId, () => runMemoryExtraction(guildId, channelId));
     }
 
- 
     if (state.since_reflection >= REFLECTION_MESSAGE_INTERVAL) {
         tryRunCognitiveJob(guildId, channelId, () => runReflectionCycle(guildId, channelId));
     }
-
 
     if (state.since_major_reflection >= MAJOR_REFLECTION_MESSAGE_INTERVAL) {
         tryRunCognitiveJob(guildId, channelId, () => runMajorReflectionCycle(guildId, channelId));
@@ -2021,6 +2180,28 @@ client.on('interactionCreate', async (interaction) => {
             for (let i = 1; i < chunks.length; i++) {
                 await interaction.followUp({ content: chunks[i], ephemeral: true });
             }
+        } else if (commandName === 'forget') {
+            const scope = interaction.options.getString('scope');
+            const confirm = interaction.options.getBoolean('confirm');
+            const targetUser = interaction.options.getUser('user');
+
+            if (targetUser && targetUser.id !== interaction.user.id) {
+                const hasPermission = interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+                if (!hasPermission) {
+                    await interaction.reply({ content: "Erasing someone else's data needs the Manage Server permission.", ephemeral: true });
+                    return;
+                }
+            }
+            if (!confirm) {
+                await interaction.reply({ content: 'Nothing was erased -- this cannot be undone, so re-run with confirm set to true if you want to go ahead.', ephemeral: true });
+                return;
+            }
+
+            await interaction.deferReply({ ephemeral: true });
+            const who = targetUser || interaction.user;
+            const displayName = sanitizeDisplayName(who.username);
+            const summary = await forgetUser(guildId, who.id, displayName, scope);
+            await interaction.editReply({ content: summary });
         }
     } catch (err) {
         console.error('[Interaction Error]', err.message);
@@ -2066,17 +2247,18 @@ client.on('messageCreate', async (message) => {
 
     await withChannelLock(message.channel.id, async () => {
         try {
-          
             db.prepare(`
                 INSERT INTO history (guild_id, channel_id, user_id, user_name, role, content, image_urls)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             `).run(guildId, message.channel.id, message.author.id, userName, 'user', fullMessageContent, JSON.stringify(imageUrls));
 
-        
+            
             runScheduledJobs(guildId, message.channel.id);
+
             
             const isExplicitMention = message.mentions.has(client.user);
             let threads;
+            let freshSocialBrainCall = false;
             if (isExplicitMention) {
                 threads = getLocalThreadsBestEffort(guildId, message.channel.id);
                 updateConversationThreads(guildId, message.channel.id).catch(err =>
@@ -2084,10 +2266,11 @@ client.on('messageCreate', async (message) => {
                 );
             } else if (shouldCallSocialBrainNow(message.channel.id)) {
                 threads = await updateConversationThreads(guildId, message.channel.id);
+                freshSocialBrainCall = true;
             } else {
                 threads = getLocalThreadsBestEffort(guildId, message.channel.id);
             }
-    
+           
             const speakerThreads = threads.filter(t =>
                 t.participants.some(p => p.toLowerCase() === userName.toLowerCase())
             );
@@ -2095,7 +2278,7 @@ client.on('messageCreate', async (message) => {
                 (t.expected_next_speaker || '').toLowerCase() === 'akari'
             ) || speakerThreads[0];
 
-        
+          
             const shouldReply = isExplicitMention || (
                 activeThread &&
                 (activeThread.expected_next_speaker || '').toLowerCase() === 'akari' &&
@@ -2104,6 +2287,7 @@ client.on('messageCreate', async (message) => {
 
             logDiagnostic(guildId, message.channel.id, 'social_decision', {
                 isExplicitMention,
+                freshSocialBrainCall,
                 replyProbability: activeThread?.reply_probability ?? null,
                 expectedNextSpeaker: activeThread?.expected_next_speaker ?? null,
                 confidence: activeThread?.confidence ?? null,
@@ -2130,10 +2314,10 @@ client.on('messageCreate', async (message) => {
                 ];
 
                 for (const m of pastMessages) {
-       
+             
                     formattedMessages.push({
                         role: m.role === 'user' ? 'user' : 'assistant',
-                        content: m.role === 'user' ? `${m.user_name}: ${m.content}` : m.content
+                        content: m.role === 'user' ? `${m.user_name}: ${sanitizeContentForTranscript(m.content)}` : m.content
                     });
                 }
 
@@ -2141,7 +2325,6 @@ client.on('messageCreate', async (message) => {
                 const botReply = await callLLM(PRIMARY_MODEL, formattedMessages);
                 logDiagnostic(guildId, message.channel.id, 'main_reply', { latencyMs: Date.now() - replyStartedAt, replyLength: botReply.length });
 
-       
                
                 await sendChunkedReply(message, botReply);
 
@@ -2161,11 +2344,11 @@ client.on('messageCreate', async (message) => {
     });
 });
 
-
+// Client Ready Event
 client.once('clientReady', async () => {
-    console.log(`[Success] Akari 10.0 Cognitive Engine online as ${client.user.tag}`);
+    console.log(`[Success] Akari 9.5 Cognitive Engine online as ${client.user.tag}`);
     try {
-        await client.application.commands.set([setupCommand, disableCommand, statsCommand]);
+        await client.application.commands.set([setupCommand, disableCommand, statsCommand, forgetCommand]);
     } catch (err) {
         console.error('[Slash Command Error]', err.message);
     }
@@ -2182,20 +2365,18 @@ if (supabase) {
             const log = db.prepare(`SELECT last_reflection_at FROM reflection_log WHERE guild_id = ? AND channel_id = ?`).get(cfg.guild_id, cfg.channel_id);
             const lastMsg = db.prepare(`SELECT timestamp FROM history WHERE guild_id = ? AND channel_id = ? ORDER BY id DESC LIMIT 1`).get(cfg.guild_id, cfg.channel_id);
             if (!lastMsg) continue; 
-
             const lastReflectionAt = log ? parseSqliteTimestamp(log.last_reflection_at) : null;
             const lastMessageAt = parseSqliteTimestamp(lastMsg.timestamp);
             const minutesSinceReflection = lastReflectionAt ? (Date.now() - lastReflectionAt.getTime()) / 60000 : Infinity;
             const alreadyReflectedOnLatest = lastReflectionAt && lastReflectionAt.getTime() > lastMessageAt.getTime();
 
             if (minutesSinceReflection >= REFLECTION_MIN_INTERVAL_MINUTES && !alreadyReflectedOnLatest) {
-                
+           
                 tryRunCognitiveJob(cfg.guild_id, cfg.channel_id, () => runReflectionCycle(cfg.guild_id, cfg.channel_id));
             }
         }
     }, REFLECTION_TIMER_CHECK_MS);
 }
-
 
 
 setInterval(() => {
@@ -2207,8 +2388,18 @@ setInterval(() => {
 
 setInterval(() => {
     try {
-        const result = db.prepare(`DELETE FROM history WHERE timestamp <= datetime('now', '-' || ? || ' days')`).run(HISTORY_RETENTION_DAYS);
-        if (result.changes > 0) console.log(`[Housekeeping] Purged ${result.changes} history row(s) older than ${HISTORY_RETENTION_DAYS} days.`);
+        const result = db.prepare(`
+            DELETE FROM history
+            WHERE (
+                timestamp <= datetime('now', '-' || ? || ' days')
+                AND EXISTS (
+                    SELECT 1 FROM scheduler_state s
+                    WHERE s.guild_id = history.guild_id AND s.channel_id = history.channel_id
+                      AND history.id <= s.last_extracted_id
+                )
+            ) OR timestamp <= datetime('now', '-' || ? || ' days')
+        `).run(HISTORY_RETENTION_DAYS, HISTORY_HARD_RETENTION_DAYS);
+        if (result.changes > 0) console.log(`[Housekeeping] Purged ${result.changes} history row(s) (extracted and past ${HISTORY_RETENTION_DAYS}d, or past the ${HISTORY_HARD_RETENTION_DAYS}d hard backstop regardless).`);
     } catch (err) {
         console.error('[Housekeeping Error]', err.message);
     }
