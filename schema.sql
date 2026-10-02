@@ -1,26 +1,31 @@
 -- Akari schema 
--- How to use: open your Supabase project > SQL Editor > New query, paste this whole file, and press Run, It is safe to run more than once, including over a database that already ran an earlier version of this script, it only creates or alters what's missing/changed and never deletes data
+-- How to use: open your Supabase project > SQL Editor > New query, paste this whole file, and press Run. It is safe to run more than once, including over a database that already ran an earlier version of this script: it only creates or alters what's missing/changed and never deletes data
+
+
+
+
 
 
 create extension if not exists vector with schema extensions;
 
 
 
+
 create table if not exists public.long_term_memory (
     id              bigint generated always as identity primary key,
     guild_id        text             not null,
-    subject         text,                                   
-    subject_id      text,                                   
-    summary         text             not null,              
-    nature          text             not null default 'fact', 
+    subject         text,                                   -- usually a user name; null = general
+    subject_id      text,                                   -- stable Discord id for `subject`, when resolvable; null for non-person subjects or unresolved names
+    summary         text             not null,              -- one third-person sentence
+    nature          text             not null default 'fact', -- fact | preference | relationship | event
     importance      double precision not null default 0.5 check (importance between 0 and 1),
     confidence      double precision not null default 0.7 check (confidence between 0 and 1),
     embedding       vector(384),
-    embedding_model text,                                  
+    embedding_model text,                                  -- which model produced `embedding`; set by bot.js on insert/merge
     status          text             not null default 'active'
                         check (status in ('active', 'fading', 'archived', 'forgotten')),
-    evidence_count  integer          not null default 1,   
-    access_count    integer          not null default 0,    
+    evidence_count  integer          not null default 1,    -- how many times this was re-observed / merged
+    access_count    integer          not null default 0,    -- how many times it was recalled
     last_accessed   timestamptz      not null default now(),
     created_at      timestamptz      not null default now()
 );
@@ -39,7 +44,6 @@ create index if not exists long_term_memory_subject_id_idx
 
 
 
-
 create table if not exists public.beliefs (
     id              bigint generated always as identity primary key,
     guild_id        text             not null,
@@ -50,7 +54,7 @@ create table if not exists public.beliefs (
     confidence      double precision not null default 0.45 check (confidence between 0 and 1),
     evidence_count  integer          not null default 1,
     embedding       vector(384),
-    embedding_model text,                                     
+    embedding_model text,                                    
     last_updated    timestamptz      not null default now(),
     created_at      timestamptz      not null default now()
 );
@@ -75,7 +79,6 @@ create table if not exists public.belief_evidence (
 create index if not exists belief_evidence_memory_idx on public.belief_evidence (memory_id);
 
 
-
 create table if not exists public.goals (
     id            bigint generated always as identity primary key,
     guild_id      text             not null,
@@ -90,7 +93,6 @@ create table if not exists public.goals (
 create index if not exists goals_guild_status_idx on public.goals (guild_id, status);
 
 
-
 create table if not exists public.user_profiles (
     guild_id    text        not null,
     user_name   text        not null,
@@ -103,15 +105,15 @@ create table if not exists public.user_profiles (
 alter table public.user_profiles add column if not exists user_id text;
 
 
+drop index if exists public.user_profiles_guild_user_id_idx;
 create unique index if not exists user_profiles_guild_user_id_idx
-    on public.user_profiles (guild_id, user_id) where user_id is not null;
-
+    on public.user_profiles (guild_id, user_id);
 
 
 create table if not exists public.relationship_state (
     guild_id      text             not null,
     user_name     text             not null,
-    user_id       text,                             
+    user_id       text,                            
     rapport       double precision not null default 0.5 check (rapport between 0 and 1),
     current_read  text,
     updated_at    timestamptz      not null default now(),
@@ -120,8 +122,12 @@ create table if not exists public.relationship_state (
 
 alter table public.relationship_state add column if not exists user_id text;
 
+
+drop index if exists public.relationship_state_guild_user_id_idx;
 create unique index if not exists relationship_state_guild_user_id_idx
-    on public.relationship_state (guild_id, user_id) where user_id is not null;
+    on public.relationship_state (guild_id, user_id);
+
+
 
 
 
@@ -159,6 +165,7 @@ as $$
     order by m.embedding <=> query_embedding
     limit match_count;
 $$;
+
 
 
 
@@ -204,6 +211,7 @@ as $$
 $$;
 
 
+
 drop function if exists public.reinforce_memories(bigint[]);
 
 create or replace function public.reinforce_memories(memory_ids bigint[])
@@ -217,6 +225,7 @@ as $$
         status        = case when status = 'fading' then 'active' else status end
     where id = any (memory_ids);
 $$;
+
 
 
 
@@ -270,7 +279,6 @@ as $$
     where e.belief_id = any (belief_ids)
     group by e.belief_id;
 $$;
-
 
 
 
