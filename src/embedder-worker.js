@@ -1,5 +1,3 @@
-// loaded via `new Worker(path.join(__dirname, 'embedder-worker.js'))`
-
 import { parentPort } from 'node:worker_threads';
 
 let embedder = null;
@@ -7,7 +5,6 @@ let embedder = null;
 async function initEmbedder() {
     try {
         const { pipeline } = await import('@huggingface/transformers');
-
         embedder = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2', { dtype: 'fp32' });
         parentPort.postMessage({ type: 'ready' });
     } catch (err) {
