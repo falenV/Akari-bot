@@ -12,18 +12,17 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // 1. MODEL CONFIGURATIONS AND CONSTANTS
 
 
-// Cognitive and Text Models
+// Cognitive, Text, and Vision Models
 const PRIMARY_MODEL = "deepseek/deepseek-v4-flash-0731";
 const FALLBACK_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free";
 const SOCIAL_MODEL = "nvidia/nemotron-3-super-120b-a12b:free";
 
-// OpenRouter's free-model catalog rotates constantly. These two slugs were confirmed, live as of September 2026, but verify at https://openrouter.ai/models before deploying.
 
 const PRIMARY_VISION_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free";
 const FALLBACK_VISION_MODEL = "google/gemma-4-31b-it:free";
 
 const DISCORD_MAX_MESSAGE_LENGTH = 2000;
-const LLM_REQUEST_TIMEOUT_MS = 20000; // bounds how long a hung OpenRouter call can hold a channel's lock
+const LLM_REQUEST_TIMEOUT_MS = 20000; 
 
 
 const SHORT_TERM_TOKEN_BUDGET = 9000;
@@ -38,9 +37,9 @@ const REFLECTION_MIN_INTERVAL_MINUTES = 180;
 const REFLECTION_TIMER_CHECK_MS = 30 * 60 * 1000; // background check for quiet channels
 const MAX_ACTIVE_BELIEFS = 25;
 const MAX_ACTIVE_GOALS = 5;
+const MAX_ACTIVE_CHANNELS_PER_GUILD = 10; // raise if you need more
 
-// Long-term memory retrieval tuning
-const MEMORY_CANDIDATE_COUNT = 15; // fetched from pgvector before reranking
+const MEMORY_CANDIDATE_COUNT = 15; 
 const MEMORY_SIMILARITY_FLOOR = 0.35;
 const MEMORY_CONFIDENCE_FLOOR = 0.3;
 const MEMORY_MAX_RETURN = 8;
@@ -56,7 +55,7 @@ const MAX_RAPPORT_CHANGE_PER_REFLECTION = 0.08;
 
 
 const BELIEF_MATCH_THRESHOLD = 0.83; // cosine similarity to treat a new statement as "the same belief"
-const BELIEF_LEARNING_RATE = 0.18; // reinforcement: how far confidence moves toward 1
+const BELIEF_LEARNING_RATE = 0.18; // reinforcement, how far confidence moves toward 1
 const BELIEF_DECAY_RATE = 0.15; // weakening: how far confidence moves toward 0
 const BELIEF_NEW_STARTING_CONFIDENCE = 0.45;
 const BELIEF_PASSIVE_DECAY = 0.05; // per idle reflection cycle, for beliefs nobody reinforced or weakened
@@ -70,8 +69,8 @@ const MAJOR_REFLECTION_MESSAGE_INTERVAL = 1200;
 const MAJOR_REFLECTION_STALE_GOAL_DAYS = 21; // goals untouched this long get dropped as stale
 
 const THOUGHT_STREAM_CLEANUP_DAYS = 7; // consumed private thoughts older than this get purged
-const DIAGNOSTICS_RETENTION_DAYS = 30; // local telemetry used to tune constants against real usage
-const HISTORY_RETENTION_DAYS = 30; // raw local transcript purge -- long-term memory in Supabase is the durable record
+const DIAGNOSTICS_RETENTION_DAYS = 30; 
+const HISTORY_RETENTION_DAYS = 30; 
 
 const HISTORY_HARD_RETENTION_DAYS = 90;
 const HISTORY_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // once a day
@@ -107,7 +106,7 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 let embedderWorker = null;
 let embedderReady = false;
 let embedderRestartAttempts = 0;
-const EMBEDDER_MAX_RESTART_ATTEMPTS = 5; // after this many failures in a row, stop retrying until the process restarts
+const EMBEDDER_MAX_RESTART_ATTEMPTS = 5; 
 const pendingEmbedRequests = new Map();
 let nextEmbedRequestId = 1;
 
@@ -121,7 +120,7 @@ function initEmbedder() {
         embedderWorker.on('message', (msg) => {
             if (msg.type === 'ready') {
                 embedderReady = true;
-                embedderRestartAttempts = 0; 
+                embedderRestartAttempts = 0; // healthy again -- reset the backoff counter
                 console.log('[Embedder] MiniLM-L6-v2 initialized successfully (worker thread).');
             } else if (msg.type === 'init_error') {
                 console.warn('[Embedder Warning] Worker failed to initialize:', msg.error);
@@ -189,8 +188,9 @@ const db = new DatabaseSync('./local_shortterm.db');
 
 db.exec(`
     CREATE TABLE IF NOT EXISTS configs (
-        guild_id TEXT PRIMARY KEY,
-        channel_id TEXT
+        guild_id TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        PRIMARY KEY (guild_id, channel_id)
     );
     CREATE TABLE IF NOT EXISTS history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -263,6 +263,36 @@ db.exec(`
         PRIMARY KEY (guild_id, channel_id)
     );
 `);
+
+
+db.exec(`CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT)`);
+const CURRENT_LOCAL_SCHEMA_VERSION = 2; // 1 = original (one channel per guild), 2 = multi-channel configs
+(function migrateLocalSchema() {
+    const row = db.prepare(`SELECT value FROM schema_meta WHERE key = 'local_schema_version'`).get();
+    let version = row ? parseInt(row.value, 10) : 1; // absence means pre-versioning, i.e. v1
+
+    if (version < 2) {
+        
+        console.log('[Migration] Upgrading local schema for multi-channel support...');
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS configs_v2 (
+                guild_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                PRIMARY KEY (guild_id, channel_id)
+            );
+            INSERT INTO configs_v2 (guild_id, channel_id) SELECT guild_id, channel_id FROM configs;
+            DROP TABLE configs;
+            ALTER TABLE configs_v2 RENAME TO configs;
+        `);
+        version = 2;
+        console.log('[Migration] Local schema upgraded to v2.');
+    }
+
+    db.prepare(`
+        INSERT INTO schema_meta (key, value) VALUES ('local_schema_version', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(String(version));
+})();
 
 
 function logDiagnostic(guildId, channelId, eventType, payload) {
@@ -597,13 +627,15 @@ const client = new Client({
 // Slash Commands
 const setupCommand = new SlashCommandBuilder()
     .setName('setup')
-    .setDescription('Set the active channel for Akari')
+    .setDescription('Add an active channel for Akari (a server can have more than one)')
     .addChannelOption(opt => opt.setName('channel').setDescription('Target channel').setRequired(true))
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
 
 const disableCommand = new SlashCommandBuilder()
     .setName('disable')
-    .setDescription('Disable Akari in this server')
+    .setDescription('Disable Akari in a channel (defaults to the one this is run in)')
+    .addChannelOption(opt => opt.setName('channel').setDescription('Channel to disable (default: this one)').setRequired(false))
+    .addBooleanOption(opt => opt.setName('everywhere').setDescription('Disable in every channel in this server').setRequired(false))
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
 
 const statsCommand = new SlashCommandBuilder()
@@ -695,6 +727,107 @@ function hasNegationMismatch(textA, textB) {
     return NEGATION_CUES.test(textA || '') !== NEGATION_CUES.test(textB || '');
 }
 
+
+const LEGACY_SOURCE = 'legacy';
+const MIN_CORROBORATING_SOURCES = 2;
+const MIN_SERVER_BELIEF_CONTRIBUTORS = 2;
+
+function uniqueParticipantIds(nameToId) {
+    return new Set(nameToId.values());
+}
+
+
+function resolveAsserterIds(names, nameToId) {
+    const ids = new Set();
+    const list = Array.isArray(names) ? names : (typeof names === 'string' ? [names] : []);
+    for (const raw of list) {
+        if (typeof raw !== 'string') continue;
+        const key = raw.trim().toLowerCase();
+        if (!key || key === 'akari') continue;
+        const id = nameToId.get(key);
+        if (id) ids.add(id);
+    }
+   
+    if (ids.size === 0) {
+        const everyone = uniqueParticipantIds(nameToId);
+        if (everyone.size === 1) return [...everyone];
+    }
+    return [...ids];
+}
+
+
+function mergeSourceArrays(a, b) {
+    if (a == null && b == null) return null;
+    const out = new Set();
+    for (const arr of [a, b]) {
+        if (arr == null) out.add(LEGACY_SOURCE);
+        else for (const x of arr) out.add(x);
+    }
+    return [...out];
+}
+
+function mergeNameArrays(a, b) {
+    const seen = new Map();
+    for (const n of [...(a || []), ...(b || [])]) {
+        if (n && !seen.has(n.toLowerCase())) seen.set(n.toLowerCase(), n);
+    }
+    return [...seen.values()];
+}
+
+
+function displayNameForSource(guildId, userId, fallbackName) {
+    const row = db.prepare(`
+        SELECT user_name FROM history WHERE guild_id = ? AND user_id = ? AND role = 'user'
+        ORDER BY id DESC LIMIT 1
+    `).get(guildId, userId);
+    return row?.user_name || fallbackName || 'someone';
+}
+
+
+function classifyMemoryTrust(m, speakerId, guildId) {
+    const src = m.source_ids;
+    if (src == null) return { visible: true, kind: 'legacy', label: null };
+    const set = new Set(src);
+    if (set.has(LEGACY_SOURCE)) return { visible: true, kind: 'legacy', label: null };
+    
+    if (set.size === 0) return { visible: true, kind: 'unattributed', label: null };
+
+    const subjectIsPerson = m.subject_is_person === true || Boolean(m.subject_id);
+    const subjectSpoke = Boolean(
+        (m.subject_id && set.has(m.subject_id)) ||
+        (m.subject && (m.source_names || []).some(n => (n || '').toLowerCase() === m.subject.toLowerCase()))
+    );
+    if (subjectIsPerson && subjectSpoke) return { visible: true, kind: 'self_reported', label: null };
+    if (set.size >= MIN_CORROBORATING_SOURCES) return { visible: true, kind: 'corroborated', label: null };
+
+    const onlySource = [...set][0];
+    if (subjectIsPerson) {
+        
+        if (speakerId && m.subject_id && speakerId === m.subject_id) {
+            return { visible: true, kind: 'hearsay_about_subject', label: "someone mentioned this about you, but I haven't been able to confirm it" };
+        }
+        
+        if (speakerId && speakerId === onlySource) {
+            return { visible: true, kind: 'own_hearsay', label: "this is only what you told me, and I haven't been able to verify it elsewhere" };
+        }
+        return { visible: false, kind: 'hearsay', label: null };
+    }
+    const name = displayNameForSource(guildId, onlySource, (m.source_names || [])[0]);
+    return { visible: true, kind: 'single_source', label: `according to ${name}` };
+}
+
+
+function isBeliefEstablished(b) {
+    if (b.scope === 'self') return true; 
+    const src = b.source_ids;
+    if (src == null) return true;        
+    const set = new Set(src);
+    if (set.has(LEGACY_SOURCE)) return true;
+    if (b.scope === 'server') return set.size >= MIN_SERVER_BELIEF_CONTRIBUTORS;
+    if (b.subject_id && set.has(b.subject_id)) return true;
+    return set.size >= MIN_CORROBORATING_SOURCES;
+}
+
 function parseEmbedding(raw) {
     if (!raw) return null;
     if (Array.isArray(raw)) return raw;
@@ -765,7 +898,6 @@ async function findFragmentedLegacyRow(table, guildId, userId, currentName) {
     }
     return survivor;
 }
-
  
 function chunkForDiscord(text, maxLen = DISCORD_MAX_MESSAGE_LENGTH) {
     if (!text) return [''];
@@ -807,7 +939,6 @@ function startTypingKeepAlive(channel) {
     return () => clearInterval(interval);
 }
 
-
 const channelLocks = new Map();
 function withChannelLock(channelId, fn) {
     const prev = channelLocks.get(channelId) || Promise.resolve();
@@ -819,12 +950,10 @@ function withChannelLock(channelId, fn) {
     return run;
 }
 
-
 function stripBotMention(content, botId) {
     const mentionRegex = new RegExp(`<@!?${botId}>`, 'g');
     return content.replace(mentionRegex, '').trim();
 }
-
 
 
 function sanitizeDisplayName(rawName) {
@@ -839,7 +968,6 @@ function sanitizeDisplayName(rawName) {
     }
     return name;
 }
-
 
 function sanitizeContentForTranscript(content) {
     return (content || '').replace(/\r\n|\r|\n/g, ' \\n ');
@@ -972,14 +1100,27 @@ async function mergeMemorySummaries(oldSummary, newSummary) {
 
 
 async function storeLongTermMemories(guildId, entries, nameToId = new Map()) {
-    if (!supabase || !entries || entries.length === 0) return;
+    const stats = { stored: 0, unattributed: 0 };
+    if (!supabase || !entries || entries.length === 0) return stats;
 
     for (const entry of entries) {
         if (!entry.summary) continue;
         const importance = clamp01(entry.importance ?? 0.5);
         const confidence = clamp01(entry.confidence ?? 0.7);
         const nature = entry.nature || 'fact';
-        const subjectId = entry.subject ? (nameToId.get(entry.subject.toLowerCase()) || null) : null;
+       
+        const subjectId = entry.subject
+            ? (nameToId.get(entry.subject.toLowerCase()) || resolveUserIdByNameFromHistory(guildId, entry.subject) || null)
+            : null;
+        const subjectIsPerson = subjectId ? true
+            : entry.subject_kind === 'person' ? true
+            : entry.subject_kind === 'other' ? false
+            : null;
+
+       
+        const assertedIds = resolveAsserterIds(entry.asserted_by, nameToId);
+        const assertedNames = assertedIds.map(id => displayNameForSource(guildId, id, null));
+        if (assertedIds.length === 0) stats.unattributed++;
         const embedding = await embedText(entry.summary);
 
         try {
@@ -1000,9 +1141,12 @@ async function storeLongTermMemories(guildId, entries, nameToId = new Map()) {
                         summary: merged,
                         embedding: mergedEmbedding || embedding,
                         embedding_model: EMBEDDING_MODEL_VERSION,
-                        // A memory found via the id path might still have subject_id null from
-                        // before migration -- backfill it now that we know it, at no cost.
+                       
                         subject_id: subjectId || similar[0].subject_id || null,
+                        subject_is_person: subjectIsPerson ?? similar[0].subject_is_person ?? null,
+                       
+                        source_ids: mergeSourceArrays(similar[0].source_ids, assertedIds),
+                        source_names: mergeNameArrays(similar[0].source_names, assertedNames),
                         importance: (() => {
                             const old = similar[0].importance ?? importance;
                             return clamp01(old + (1 - old) * MEMORY_MERGE_LEARNING_RATE);
@@ -1012,6 +1156,7 @@ async function storeLongTermMemories(guildId, entries, nameToId = new Map()) {
                         last_accessed: new Date().toISOString()
                     }).eq('id', similar[0].id);
                     logDiagnostic(guildId, null, 'memory_consolidation', { merged: true, nature, subject: entry.subject || null, similarity: similar[0].similarity });
+                    stats.stored++;
                     continue;
                 }
             }
@@ -1020,6 +1165,9 @@ async function storeLongTermMemories(guildId, entries, nameToId = new Map()) {
                 guild_id: guildId,
                 subject: entry.subject || null,
                 subject_id: subjectId,
+                subject_is_person: subjectIsPerson,
+                source_ids: assertedIds,
+                source_names: assertedNames,
                 summary: entry.summary,
                 nature,
                 importance,
@@ -1030,10 +1178,12 @@ async function storeLongTermMemories(guildId, entries, nameToId = new Map()) {
                 last_accessed: new Date().toISOString()
             });
             logDiagnostic(guildId, null, 'memory_consolidation', { merged: false, nature, subject: entry.subject || null });
+            stats.stored++;
         } catch (err) {
             console.warn('[Supabase Insert Warning] Failed to store long-term memory:', err.message);
         }
     }
+    return stats;
 }
 
 
@@ -1077,7 +1227,7 @@ async function runMemoryExtraction(guildId, channelId) {
 
 Output strict JSON:
 {
-  "long_term": [ { "subject": "person or thing this is about", "summary": "durable fact/preference/relationship/event, written in third person", "nature": "fact" | "preference" | "relationship" | "event", "importance": 0.0-1.0, "confidence": 0.0-1.0 } ],
+  "long_term": [ { "subject": "person or thing this is about", "subject_kind": "person" | "other", "asserted_by": ["speaker name(s) who said or confirmed this"], "summary": "durable fact/preference/relationship/event, written in third person", "nature": "fact" | "preference" | "relationship" | "event", "importance": 0.0-1.0, "confidence": 0.0-1.0 } ],
   "working": [ { "subject_name": "person or thing", "state_summary": "short-lived situational state (e.g. currently studying for an exam)", "ttl_minutes": 30 } ],
   "private_thought": null | "a brief first-person private note, 10-20 words"
 }
@@ -1091,6 +1241,8 @@ nature guide:
 importance: how much this would matter to remember months from now (a favorite hobby = high; an offhand one-time detail = low).
 confidence: how certain the transcript actually supports this (explicit statement = high; inference/guess = lower).
 
+subject vs asserted_by -- these are different and both matter. "subject" is who or what the memory is ABOUT. "asserted_by" is who actually SAID it, and must be speaker names exactly as they appear as labels in the transcript (never AKARI). They differ whenever someone talks about somebody else: if Alice says "Bob hates mornings", subject is Bob and asserted_by is ["Alice"] -- NOT Bob. Only put the subject in asserted_by if the subject themself said it (e.g. Bob says "I hate mornings"). If two people independently said the same thing, list both. Never list someone as asserting something they didn't actually write. subject_kind is "person" if the subject is a human being (in the chat or not), otherwise "other" (a game, a pet, a topic, the server itself).
+
 private_thought: a tiny, genuine private note in AKARI's own first-person voice -- something she'd quietly think to herself, not say aloud. Nobody sees this except AKARI's own future reflection. Examples: "I don't really understand why he asked that." / "I think Zandar likes talking late at night." / "I wonder if they were joking." Only include this if something in the transcript actually struck you as curious, confusing, funny, or worth remembering how it felt -- this should be rare. Return null most of the time, not every cycle.
 
 Only include long_term entries worth remembering permanently. Only include working entries for temporary situational context that will stop being true soon. If nothing qualifies for a category, return an empty array for it. Do not invent facts that aren't clearly supported by the transcript.`
@@ -1103,11 +1255,13 @@ Only include long_term entries worth remembering permanently. Only include worki
         const parsed = safeParseJSON(raw);
         if (!parsed) {
             logDiagnostic(guildId, channelId, 'extraction_result', { parseFailed: true });
+          
             return false;
         }
 
+        let storeStats = { stored: 0, unattributed: 0 };
         if (Array.isArray(parsed.long_term) && parsed.long_term.length > 0) {
-            await storeLongTermMemories(guildId, parsed.long_term, nameToId);
+            storeStats = await storeLongTermMemories(guildId, parsed.long_term, nameToId);
         }
 
         if (typeof parsed.private_thought === 'string' && parsed.private_thought.trim()) {
@@ -1131,6 +1285,8 @@ Only include long_term entries worth remembering permanently. Only include worki
         logDiagnostic(guildId, channelId, 'extraction_result', {
             parseFailed: false,
             longTermCount: parsed.long_term?.length ?? 0,
+           
+            unattributedCount: storeStats.unattributed,
             workingCount: parsed.working?.length ?? 0,
             hadPrivateThought: typeof parsed.private_thought === 'string' && !!parsed.private_thought.trim()
         });
@@ -1138,6 +1294,7 @@ Only include long_term entries worth remembering permanently. Only include worki
         return true;
     } catch (err) {
         console.error('[Memory Extraction Error]', err.message);
+       
         return false;
     }
 }
@@ -1162,14 +1319,34 @@ Only include something if the image plausibly reveals a durable fact about the p
         const raw = await callLLM(SOCIAL_MODEL, prompt, true, 'low');
         const parsed = safeParseJSON(raw);
         if (parsed && Array.isArray(parsed.long_term) && parsed.long_term.length > 0) {
+           
             const nameToId = userId ? new Map([[userName.toLowerCase(), userId]]) : new Map();
-            await storeLongTermMemories(guildId, parsed.long_term, nameToId);
+           
+            const entries = parsed.long_term.map(e => ({
+                ...e,
+                subject: e.subject || userName,
+                subject_kind: 'person',
+                asserted_by: [userName]
+            }));
+            await storeLongTermMemories(guildId, entries, nameToId);
         }
     } catch (err) {
         console.error('[Vision Memory Extraction Error]', err.message);
     }
 }
 
+
+
+function applyTrustFilter(rows, speakerId, guildId) {
+    const visible = [];
+    let hidden = 0;
+    for (const m of rows) {
+        const t = classifyMemoryTrust(m, speakerId, guildId);
+        if (!t.visible) { hidden++; continue; }
+        visible.push({ ...m, trustKind: t.kind, trustLabel: t.label });
+    }
+    return { visible, hidden };
+}
 
 async function retrieveRelevantMemories(guildId, queryText, maxReturn = MEMORY_MAX_RETURN, speakerName = null, speakerId = null) {
     if (!supabase) return [];
@@ -1195,26 +1372,32 @@ async function retrieveRelevantMemories(guildId, queryText, maxReturn = MEMORY_M
         try {
             const { data } = await supabase
                 .from('long_term_memory')
-                .select('id, subject, subject_id, summary, nature, importance, confidence, status, last_accessed, access_count')
+                .select('id, guild_id, subject, subject_id, subject_is_person, source_ids, source_names, summary, nature, importance, confidence, status, last_accessed, access_count')
                 .eq('guild_id', guildId)
                 .in('status', ['active', 'fading'])
                 .order('created_at', { ascending: false })
-                .limit(maxReturn);
+                .limit(maxReturn * 3); // over-fetch: some may be withheld as unverified hearsay
+            const { visible, hidden } = applyTrustFilter(data || [], speakerId, guildId);
+            const shown = visible.slice(0, maxReturn);
+           
             logDiagnostic(guildId, null, 'memory_retrieval', {
                 candidateCount: 0,
-                returnedCount: (data || []).length,
+                returnedCount: shown.length,
+                hiddenByTrust: hidden,
                 topScore: null,
                 fallbackUsed: true
             });
-            return data || [];
+            return shown;
         } catch (e) {
             console.warn('[Supabase Fetch Warning] Cloud memory unavailable.');
             return [];
         }
     }
 
+    const { visible: trustedCandidates, hidden: hiddenByTrust } = applyTrustFilter(candidates, speakerId, guildId);
+
     const now = Date.now();
-    const scored = candidates
+    const scored = trustedCandidates
         .filter(m => m.similarity >= MEMORY_SIMILARITY_FLOOR && (m.confidence ?? 1) >= MEMORY_CONFIDENCE_FLOOR)
         .map(m => {
             const daysSinceAccess = m.last_accessed ? (now - new Date(m.last_accessed).getTime()) / 86400000 : 999;
@@ -1245,6 +1428,7 @@ async function retrieveRelevantMemories(guildId, queryText, maxReturn = MEMORY_M
     logDiagnostic(guildId, null, 'memory_retrieval', {
         candidateCount: candidates.length,
         returnedCount: scored.length,
+        hiddenByTrust,
         topScore: scored[0]?.blended ?? null,
         fallbackUsed: false
     });
@@ -1263,7 +1447,7 @@ async function fetchCandidateMemoriesForReflection(guildId, activeUsers) {
         try {
             const queries = [
                 supabase.from('long_term_memory')
-                    .select('id, subject, summary, nature, importance')
+                    .select('id, subject, subject_id, subject_is_person, source_ids, source_names, summary, nature, importance')
                     .eq('guild_id', guildId)
                     .in('status', ['active', 'fading'])
                     .is('subject_id', null)
@@ -1274,7 +1458,7 @@ async function fetchCandidateMemoriesForReflection(guildId, activeUsers) {
             if (id) {
                 queries.push(
                     supabase.from('long_term_memory')
-                        .select('id, subject, summary, nature, importance')
+                        .select('id, subject, subject_id, subject_is_person, source_ids, source_names, summary, nature, importance')
                         .eq('guild_id', guildId)
                         .in('status', ['active', 'fading'])
                         .eq('subject_id', id)
@@ -1291,7 +1475,7 @@ async function fetchCandidateMemoriesForReflection(guildId, activeUsers) {
 
     try {
         const { data: general } = await supabase.from('long_term_memory')
-            .select('id, subject, summary, nature, importance')
+            .select('id, subject, subject_id, subject_is_person, source_ids, source_names, summary, nature, importance')
             .eq('guild_id', guildId)
             .in('status', ['active', 'fading'])
             .order('importance', { ascending: false })
@@ -1318,8 +1502,7 @@ async function linkBeliefEvidence(beliefId, memoryIds) {
 
 
 
-
-async function applyBeliefUpdates(guildId, currentBeliefs, updates, nameToId = new Map()) {
+async function applyBeliefUpdates(guildId, currentBeliefs, updates, nameToId = new Map(), memorySourceMap = new Map()) {
     const touched = new Set();
     const existing = currentBeliefs.map(b => ({ ...b, _embedding: parseEmbedding(b.embedding) }));
 
@@ -1330,15 +1513,25 @@ async function applyBeliefUpdates(guildId, currentBeliefs, updates, nameToId = n
         const subjectId = subject ? (nameToId.get(subject.toLowerCase()) || null) : null;
         const embedding = await embedText(u.statement);
 
+       
+        let citedSourceIds; 
+        for (const memId of (Array.isArray(u.evidence_memory_ids) ? u.evidence_memory_ids : [])) {
+            const src = memorySourceMap.get(memId);
+            if (src === undefined) continue; // cited an id we don't recognize -- ignore, don't guess
+            citedSourceIds = citedSourceIds === undefined ? src : mergeSourceArrays(citedSourceIds, src);
+        }
+
         let best = null, bestSim = 0;
         if (embedding) {
             for (const b of existing) {
                 if (b.scope !== scope || !b._embedding) continue;
+              
                 const subjectMatches = (subjectId && b.subject_id)
                     ? b.subject_id === subjectId
                     : (b.subject || null) === subject;
                 if (!subjectMatches) continue;
                 const sim = cosineSimilarity(embedding, b._embedding);
+              
                 if (sim > bestSim && !hasNegationMismatch(u.statement, b.statement)) { bestSim = sim; best = b; }
             }
         }
@@ -1348,6 +1541,7 @@ async function applyBeliefUpdates(guildId, currentBeliefs, updates, nameToId = n
             if (u.signal === 'weaken') {
                 newConfidence = best.confidence * (1 - BELIEF_DECAY_RATE);
             } else {
+                // "reinforce", "new" (mislabeled, it matched something existing), or unspecified
                 newConfidence = best.confidence + (1 - best.confidence) * BELIEF_LEARNING_RATE;
             }
             await supabase.from('beliefs').update({
@@ -1356,7 +1550,11 @@ async function applyBeliefUpdates(guildId, currentBeliefs, updates, nameToId = n
                 evidence_count: (best.evidence_count || 1) + 1,
                 embedding,
                 embedding_model: EMBEDDING_MODEL_VERSION,
+                // Backfill subject_id on a legacy row now that we know it, at no extra cost.
                 subject_id: subjectId || best.subject_id || null,
+                source_ids: citedSourceIds === undefined ? best.source_ids : mergeSourceArrays(best.source_ids, citedSourceIds),
+                source_names: citedSourceIds === undefined ? best.source_names
+                    : mergeNameArrays(best.source_names, (citedSourceIds || []).map(id => displayNameForSource(guildId, id, null))),
                 last_updated: new Date().toISOString()
             }).eq('id', best.id);
             touched.add(best.id);
@@ -1365,6 +1563,9 @@ async function applyBeliefUpdates(guildId, currentBeliefs, updates, nameToId = n
             const { data: inserted, error } = await supabase.from('beliefs').insert({
                 guild_id: guildId, scope, subject, subject_id: subjectId, statement: u.statement,
                 confidence: BELIEF_NEW_STARTING_CONFIDENCE, evidence_count: 1,
+               
+                source_ids: citedSourceIds === undefined ? [] : citedSourceIds,
+                source_names: citedSourceIds === undefined ? [] : (citedSourceIds || []).map(id => displayNameForSource(guildId, id, null)),
                 embedding, embedding_model: EMBEDDING_MODEL_VERSION, last_updated: new Date().toISOString()
             }).select('id').single();
             if (error) { console.warn('[Reflection] Belief insert failed:', error.message); continue; }
@@ -1417,7 +1618,7 @@ async function passivelyDecayBeliefs(guildId, currentBeliefs, touchedIds) {
 
 
 async function runReflectionCycle(guildId, channelId) {
-    if (!supabase) return true; 
+    if (!supabase) return true; // never configured -- retrying this every cycle forever would be pointless
     console.log(`[Reflection] Starting reflection cycle for guild ${guildId}...`);
 
     try {
@@ -1437,6 +1638,8 @@ async function runReflectionCycle(guildId, channelId) {
             guildId,
             activeUsers.map(name => ({ name, id: nameToId.get(name.toLowerCase()) || null }))
         );
+      
+        const memorySourceMap = new Map(candidateMemories.map(m => [m.id, m.source_ids || null]));
 
         const pendingThoughts = db.prepare(`
             SELECT id, thought FROM thought_stream
@@ -1460,7 +1663,7 @@ Your own recent private thoughts (things you noted to yourself, not said aloud, 
 ${pendingThoughts.map(t => `- ${t.thought}`).join('\n') || '(none recently)'}
 
 Available memories Akari could cite as evidence (id: summary):
-${candidateMemories.map(m => `${m.id}: ${m.summary}`).join('\n') || '(none yet)'}
+${candidateMemories.map(m => `${m.id}: ${m.summary}${(m.source_ids && m.source_ids.length >= MIN_CORROBORATING_SOURCES) ? ' [corroborated by multiple people]' : (m.source_ids && m.source_ids.length === 1) ? ' [one person\'s claim]' : ''}`).join('\n') || '(none yet)'}
 
 Output strict JSON:
 {
@@ -1483,7 +1686,7 @@ Output strict JSON:
         }
 
         if (Array.isArray(parsed.beliefs)) {
-            const touched = await applyBeliefUpdates(guildId, currentBeliefs || [], parsed.beliefs, nameToId);
+            const touched = await applyBeliefUpdates(guildId, currentBeliefs || [], parsed.beliefs, nameToId, memorySourceMap);
             await passivelyDecayBeliefs(guildId, currentBeliefs || [], touched);
         }
 
@@ -1499,7 +1702,7 @@ Output strict JSON:
                 const existing = byText.get(normalize(g.goal));
 
                 if (action === 'complete' || action === 'drop') {
-                    
+                   
                     if (existing) idsToRemove.push(existing.id);
                     continue;
                 }
@@ -1512,10 +1715,9 @@ Output strict JSON:
                     status: 'active',
                     last_updated: new Date().toISOString()
                 });
-                if (existing) idsToRemove.push(existing.id); 
+                if (existing) idsToRemove.push(existing.id);
             }
-            
-
+          
             try {
                 if (idsToRemove.length > 0) {
                     await supabase.from('goals').delete().in('id', idsToRemove);
@@ -1524,7 +1726,7 @@ Output strict JSON:
                     const { error: insertError } = await supabase.from('goals').insert(rowsToInsert);
                     if (insertError) throw insertError;
                 }
-                
+              
                 const { data: allGoals } = await supabase.from('goals')
                     .select('id, priority').eq('guild_id', guildId).eq('status', 'active')
                     .order('priority', { ascending: false });
@@ -1539,18 +1741,18 @@ Output strict JSON:
         if (Array.isArray(parsed.user_updates)) {
             for (const u of parsed.user_updates) {
                 if (!u.user_name) continue;
-               
+              
                 const userId = nameToId.get(u.user_name.toLowerCase()) || null;
                 const conflictTarget = userId ? 'guild_id,user_id' : 'guild_id,user_name';
 
                 if (userId) {
-                    
+                
                     await supabase.from('user_profiles').update({ user_id: userId })
                         .eq('guild_id', guildId).eq('user_name', u.user_name).is('user_id', null);
                     await supabase.from('relationship_state').update({ user_id: userId })
                         .eq('guild_id', guildId).eq('user_name', u.user_name).is('user_id', null);
 
-                   
+                  
                     for (const table of ['user_profiles', 'relationship_state']) {
                         const { data: alreadyLinked } = await supabase.from(table)
                             .select('user_name').eq('guild_id', guildId).eq('user_id', userId).maybeSingle();
@@ -1575,7 +1777,7 @@ Output strict JSON:
                     }, { onConflict: conflictTarget });
                 }
 
-               
+                
                 const existingRapport = await fetchIdentityLinkedRow('relationship_state', guildId, userId, u.user_name, 'rapport, updated_at');
                 const currentRapport = existingRapport ? decayRapport(existingRapport.rapport, existingRapport.updated_at) : RAPPORT_BASELINE;
                 const proposedRapport = clamp01(u.rapport ?? RAPPORT_BASELINE);
@@ -1618,6 +1820,7 @@ Output strict JSON:
         return true;
     } catch (err) {
         console.error('[Reflection Error]', err.message);
+      
         return false;
     }
 }
@@ -1634,7 +1837,7 @@ async function dedupBeliefs(guildId) {
         if (toDelete.has(parsed[i].id)) continue;
         for (let j = i + 1; j < parsed.length; j++) {
             if (toDelete.has(parsed[j].id)) continue;
-            
+           
             const subjectMatches = (parsed[i].subject_id && parsed[j].subject_id)
                 ? parsed[i].subject_id === parsed[j].subject_id
                 : (parsed[i].subject || null) === (parsed[j].subject || null);
@@ -1642,7 +1845,7 @@ async function dedupBeliefs(guildId) {
 
             const sim = cosineSimilarity(parsed[i]._embedding, parsed[j]._embedding);
             if (sim < BELIEF_MATCH_THRESHOLD) continue;
-            
+           
             if (hasNegationMismatch(parsed[i].statement, parsed[j].statement)) continue;
 
             const survivor = parsed[i].confidence >= parsed[j].confidence ? parsed[i] : parsed[j];
@@ -1650,7 +1853,9 @@ async function dedupBeliefs(guildId) {
 
             await supabase.from('beliefs').update({
                 confidence: clamp01(survivor.confidence + (1 - survivor.confidence) * 0.1),
-                evidence_count: (survivor.evidence_count || 1) + (dupe.evidence_count || 1)
+                evidence_count: (survivor.evidence_count || 1) + (dupe.evidence_count || 1),
+                source_ids: mergeSourceArrays(survivor.source_ids, dupe.source_ids),
+                source_names: mergeNameArrays(survivor.source_names, dupe.source_names)
             }).eq('id', survivor.id);
 
             const { data: dupeEvidence } = await supabase.from('belief_evidence').select('memory_id').eq('belief_id', dupe.id);
@@ -1682,7 +1887,7 @@ async function runMajorReflectionCycle(guildId, channelId) {
 
         const { data: selfBeliefs } = await supabase.from('beliefs').select('*').eq('guild_id', guildId).eq('scope', 'self');
         const { data: topMemories } = await supabase.from('long_term_memory')
-            .select('id, subject, summary, nature, importance')
+            .select('id, subject, subject_id, subject_is_person, source_ids, source_names, summary, nature, importance')
             .eq('guild_id', guildId)
             .in('status', ['active', 'fading'])
             .order('importance', { ascending: false })
@@ -1937,7 +2142,7 @@ async function getCognitiveCore(guildId, userId, userName, userPrompt) {
 
     const [memories, beliefsRes, goalsRes, profile, rapport] = await Promise.all([
         retrieveRelevantMemories(guildId, `${userName}: ${userPrompt}`, MEMORY_MAX_RETURN, userName, userId),
-        supabase.from('beliefs').select('scope, subject, subject_id, statement').eq('guild_id', guildId),
+        supabase.from('beliefs').select('scope, subject, subject_id, statement, source_ids').eq('guild_id', guildId),
         supabase.from('goals').select('*').eq('guild_id', guildId).eq('status', 'active').order('priority', { ascending: false }),
         fetchIdentityLinkedRow('user_profiles', guildId, userId, userName, 'summary'),
         fetchIdentityLinkedRow('relationship_state', guildId, userId, userName, 'rapport, current_read, updated_at')
@@ -1945,14 +2150,20 @@ async function getCognitiveCore(guildId, userId, userName, userPrompt) {
 
     let memoryStr = "";
     if (memories.length > 0) {
+      
         memoryStr = "\n\n# Long-Term Memories:\n" + memories.map(m => {
             const hedge = (m.status === 'fading' || (m.confidence ?? 1) < 0.5) ? ' (this one feels uncertain, half-remembered)' : '';
-            return m.nature === 'event' ? `- You recall: ${m.summary}${hedge}` : `- [${m.nature}] ${m.summary}${hedge}`;
+           
+            const attribution = m.trustLabel ? ` (${m.trustLabel})` : '';
+            return m.nature === 'event'
+                ? `- You recall: ${m.summary}${attribution}${hedge}`
+                : `- [${m.nature}] ${m.summary}${attribution}${hedge}`;
         }).join("\n");
     }
 
     let beliefStr = "";
-    const relevantBeliefs = (beliefsRes.data || []).filter(b =>
+   
+    const relevantBeliefs = (beliefsRes.data || []).filter(b => isBeliefEstablished(b)).filter(b =>
         b.scope !== 'user' || (
             (b.subject_id && userId) ? b.subject_id === userId
                 : Boolean(b.subject && b.subject.toLowerCase() === userName.toLowerCase())
@@ -1983,6 +2194,7 @@ async function getCognitiveCore(guildId, userId, userName, userPrompt) {
 }
 
 
+
 async function forgetUser(guildId, userId, displayName, scope) {
     if (!supabase) {
         return `Akari's long-term memory isn't connected, so there's nothing stored in the cloud to erase for ${displayName}.` +
@@ -1997,7 +2209,6 @@ async function forgetUser(guildId, userId, displayName, scope) {
         .eq('guild_id', guildId).is('subject_id', null).ilike('subject', escapedName).select('id');
     const memoryCount = (memById?.length || 0) + (memByName?.length || 0);
 
-    // belief_evidence rows cascade automatically (on delete cascade, see schema.sql)
     const { data: beliefById } = await supabase.from('beliefs').delete()
         .eq('guild_id', guildId).eq('scope', 'user').eq('subject_id', userId).select('id');
     const { data: beliefByName } = await supabase.from('beliefs').delete()
@@ -2016,7 +2227,7 @@ async function forgetUser(guildId, userId, displayName, scope) {
         .eq('guild_id', guildId).is('user_id', null).ilike('user_name', escapedName).select('user_name');
     let rapportCount = (rapById?.length || 0) + (rapByName?.length || 0);
 
-   
+    
     for (const [table, counter] of [['user_profiles', () => profileCount++], ['relationship_state', () => rapportCount++]]) {
         const legacy = await findFragmentedLegacyRow(table, guildId, userId, displayName);
         if (legacy) {
@@ -2068,10 +2279,11 @@ async function buildStatsReport(guildId) {
     const mentionCount = social.filter(s => s.isExplicitMention).length;
     const threadTriggerCount = social.filter(s => !s.isExplicitMention && s.shouldReply).length;
     const replyCount = social.filter(s => s.shouldReply).length;
+    
     const freshSocialCalls = social.filter(s => s.freshSocialBrainCall === true);
 
     const lines = [
-        `**Akari Diagnostics** (last ${social.length} social decisions logged, ${totalMessages} messages seen total)`,
+        `**Akari Diagnostics** (${db.prepare('SELECT COUNT(*) as n FROM configs WHERE guild_id = ?').get(guildId).n} active channel(s), last ${social.length} social decisions logged, ${totalMessages} messages seen total)`,
         ``,
         `**Social brain**`,
         `- Reply rate: ${pct(replyCount, social.length)} (${mentionCount} via mention, ${threadTriggerCount} via thread probability)`,
@@ -2086,9 +2298,11 @@ async function buildStatsReport(guildId) {
         `- Zero-result rate: ${pct(retrievals.filter(r => (r.returnedCount || 0) === 0).length, retrievals.length)}`,
         `- Recency-fallback rate: ${pct(retrievals.filter(r => r.fallbackUsed).length, retrievals.length)} (embedder down or vector search returned nothing)`,
         `- Consolidation merge rate: ${pct(consolidations.filter(c => c.merged).length, consolidations.length)} (n=${consolidations.length} inserts checked)`,
+        `- Withheld as unverified hearsay: ${avg(retrievals, 'hiddenByTrust')} avg per retrieval (single-source claims about a specific person, shown to nobody but them until corroborated)`,
         ``,
         `**Extraction / reflection**`,
         `- Extraction runs: ${extractions.length} (JSON parse failures: ${pct(extractions.filter(e => e.parseFailed).length, extractions.length)})`,
+        `- Unattributed claims: ${extractions.reduce((a, e) => a + (e.unattributedCount || 0), 0)} total (model named no verifiable speaker -- high numbers mean attribution, and everything built on it, isn't working)`,
         `- Reflection runs: ${reflections.length} (JSON parse failures: ${pct(reflections.filter(r => r.parseFailed).length, reflections.length)})`,
         `- Major reflection runs: ${majorReflections.length}`,
         ``,
@@ -2122,14 +2336,13 @@ async function buildStatsReport(guildId) {
 
 const cognitiveLocks = new Set();
 
-function tryRunCognitiveJob(guildId, channelId, fn) {
-    const key = `${guildId}:${channelId}`;
-    if (cognitiveLocks.has(key)) return false;
-    cognitiveLocks.add(key);
+function tryRunCognitiveJob(guildId, fn) {
+    if (cognitiveLocks.has(guildId)) return false;
+    cognitiveLocks.add(guildId);
     Promise.resolve()
         .then(fn)
-        .catch(err => console.error(`[Cognitive Lock] Job for ${key} threw:`, err.message))
-        .finally(() => cognitiveLocks.delete(key));
+        .catch(err => console.error(`[Cognitive Lock] Job for guild ${guildId} threw:`, err.message))
+        .finally(() => cognitiveLocks.delete(guildId));
     return true;
 }
 
@@ -2149,19 +2362,17 @@ function runScheduledJobs(guildId, channelId) {
         FROM scheduler_state WHERE guild_id = ? AND channel_id = ?
     `).get(guildId, channelId);
 
-    // Fast/cheap: raw fact + working memory capture, plus the occasional private thought
     if (state.since_extraction >= EXTRACTION_INTERVAL) {
-        tryRunCognitiveJob(guildId, channelId, () => runMemoryExtraction(guildId, channelId));
+        tryRunCognitiveJob(guildId, () => runMemoryExtraction(guildId, channelId));
     }
 
     // Moderate/deep: belief/goal/profile/rapport reflection + memory decay
     if (state.since_reflection >= REFLECTION_MESSAGE_INTERVAL) {
-        tryRunCognitiveJob(guildId, channelId, () => runReflectionCycle(guildId, channelId));
+        tryRunCognitiveJob(guildId, () => runReflectionCycle(guildId, channelId));
     }
 
-    // Rare/expensive: belief dedup + "who is Akari becoming" self-reflection
     if (state.since_major_reflection >= MAJOR_REFLECTION_MESSAGE_INTERVAL) {
-        tryRunCognitiveJob(guildId, channelId, () => runMajorReflectionCycle(guildId, channelId));
+        tryRunCognitiveJob(guildId, () => runMajorReflectionCycle(guildId, channelId));
     }
 }
 
@@ -2176,11 +2387,29 @@ client.on('interactionCreate', async (interaction) => {
     try {
         if (commandName === 'setup') {
             const targetChannel = interaction.options.getChannel('channel');
-            db.prepare(`INSERT INTO configs (guild_id, channel_id) VALUES (?, ?) ON CONFLICT(guild_id) DO UPDATE SET channel_id = ?`).run(guildId, targetChannel.id, targetChannel.id);
-            await interaction.reply({ content: `Akari is active in <#${targetChannel.id}>!`, ephemeral: true });
+            const existing = db.prepare(`SELECT channel_id FROM configs WHERE guild_id = ?`).all(guildId);
+            const alreadyActive = existing.some(c => c.channel_id === targetChannel.id);
+            if (!alreadyActive && existing.length >= MAX_ACTIVE_CHANNELS_PER_GUILD) {
+                await interaction.reply({
+                    content: `This server already has ${existing.length} active channels, which is the current limit. Run /disable on one before adding another.`,
+                    ephemeral: true
+                });
+                return;
+            }
+            db.prepare(`INSERT INTO configs (guild_id, channel_id) VALUES (?, ?) ON CONFLICT(guild_id, channel_id) DO NOTHING`).run(guildId, targetChannel.id);
+            const nowActive = db.prepare(`SELECT channel_id FROM configs WHERE guild_id = ?`).all(guildId);
+            const list = nowActive.map(c => `<#${c.channel_id}>`).join(', ');
+            await interaction.reply({ content: `Akari is active in <#${targetChannel.id}>. Active channel(s) in this server: ${list}`, ephemeral: true });
         } else if (commandName === 'disable') {
-            db.prepare(`DELETE FROM configs WHERE guild_id = ?`).run(guildId);
-            await interaction.reply({ content: `Akari disabled in this server.`, ephemeral: true });
+            const everywhere = interaction.options.getBoolean('everywhere');
+            const targetChannel = interaction.options.getChannel('channel') || interaction.channel;
+            if (everywhere) {
+                db.prepare(`DELETE FROM configs WHERE guild_id = ?`).run(guildId);
+                await interaction.reply({ content: `Akari disabled in every channel in this server.`, ephemeral: true });
+            } else {
+                db.prepare(`DELETE FROM configs WHERE guild_id = ? AND channel_id = ?`).run(guildId, targetChannel.id);
+                await interaction.reply({ content: `Akari disabled in <#${targetChannel.id}>.`, ephemeral: true });
+            }
         } else if (commandName === 'stats') {
             await interaction.deferReply({ ephemeral: true });
             const report = await buildStatsReport(guildId);
@@ -2227,8 +2456,8 @@ client.on('messageCreate', async (message) => {
     const guildId = message.guild?.id;
     if (!guildId) return;
 
-    const config = db.prepare(`SELECT channel_id FROM configs WHERE guild_id = ?`).get(guildId);
-    if (!config || config.channel_id !== message.channel.id) return;
+    const isActiveChannel = db.prepare(`SELECT 1 FROM configs WHERE guild_id = ? AND channel_id = ?`).get(guildId, message.channel.id);
+    if (!isActiveChannel) return;
 
     const userName = sanitizeDisplayName(message.member?.displayName || message.author.username);
     const cleanText = stripBotMention(message.content, client.user.id);
@@ -2261,6 +2490,7 @@ client.on('messageCreate', async (message) => {
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             `).run(guildId, message.channel.id, message.author.id, userName, 'user', fullMessageContent, JSON.stringify(imageUrls));
 
+           
             runScheduledJobs(guildId, message.channel.id);
 
             
@@ -2286,7 +2516,7 @@ client.on('messageCreate', async (message) => {
                 (t.expected_next_speaker || '').toLowerCase() === 'akari'
             ) || speakerThreads[0];
 
-            
+           
             const shouldReply = isExplicitMention || (
                 activeThread &&
                 (activeThread.expected_next_speaker || '').toLowerCase() === 'akari' &&
@@ -2354,7 +2584,7 @@ client.on('messageCreate', async (message) => {
 
 // Client Ready Event
 client.once('clientReady', async () => {
-    console.log(`[Success] Akari 9.7 Cognitive Engine online as ${client.user.tag}`);
+    console.log(`[Success] Akari 9.0 Cognitive Engine online as ${client.user.tag}`);
     try {
         await client.application.commands.set([setupCommand, disableCommand, statsCommand, forgetCommand]);
     } catch (err) {
@@ -2401,7 +2631,7 @@ if (supabase) {
 
             if (minutesSinceReflection >= REFLECTION_MIN_INTERVAL_MINUTES && !alreadyReflectedOnLatest) {
                 
-                tryRunCognitiveJob(cfg.guild_id, cfg.channel_id, () => runReflectionCycle(cfg.guild_id, cfg.channel_id));
+                tryRunCognitiveJob(cfg.guild_id, () => runReflectionCycle(cfg.guild_id, cfg.channel_id));
             }
         }
     }, REFLECTION_TIMER_CHECK_MS);
