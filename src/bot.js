@@ -2584,7 +2584,7 @@ client.on('messageCreate', async (message) => {
 
 // Client Ready Event
 client.once('clientReady', async () => {
-    console.log(`[Success] Akari 9.0 Cognitive Engine online as ${client.user.tag}`);
+    console.log(`[Success] Akari 10.0 Cognitive Engine online as ${client.user.tag}`);
     try {
         await client.application.commands.set([setupCommand, disableCommand, statsCommand, forgetCommand]);
     } catch (err) {
@@ -2622,7 +2622,7 @@ if (supabase) {
         for (const cfg of configs) {
             const log = db.prepare(`SELECT last_reflection_at FROM reflection_log WHERE guild_id = ? AND channel_id = ?`).get(cfg.guild_id, cfg.channel_id);
             const lastMsg = db.prepare(`SELECT timestamp FROM history WHERE guild_id = ? AND channel_id = ? ORDER BY id DESC LIMIT 1`).get(cfg.guild_id, cfg.channel_id);
-            if (!lastMsg) continue; // nothing has ever been said here yet
+            if (!lastMsg) continue; 
 
             const lastReflectionAt = log ? parseSqliteTimestamp(log.last_reflection_at) : null;
             const lastMessageAt = parseSqliteTimestamp(lastMsg.timestamp);
