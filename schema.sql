@@ -1,31 +1,28 @@
--- Akari schema 
--- How to use: open your Supabase project > SQL Editor > New query, paste this whole file, and press Run. It is safe to run more than once, including over a database that already ran an earlier version of this script: it only creates or alters what's missing/changed and never deletes data
-
-
-
-
+-- Akari schema
+-- How to use: open your Supabase project > SQL Editor > New query, paste this whole file, and press Run, Its safe to run more than once, including over a database that already ran an earlier version of this script, it only creates or alters what's missing/changed and never deletes data
 
 
 create extension if not exists vector with schema extensions;
 
 
-
-
 create table if not exists public.long_term_memory (
     id              bigint generated always as identity primary key,
     guild_id        text             not null,
-    subject         text,                                   -- usually a user name; null = general
-    subject_id      text,                                   -- stable Discord id for `subject`, when resolvable; null for non-person subjects or unresolved names
-    summary         text             not null,              -- one third-person sentence
-    nature          text             not null default 'fact', -- fact | preference | relationship | event
+    subject         text,                                   
+    subject_id      text,                                   
+    subject_is_person boolean,                               
+    source_ids      text[],                                
+    source_names    text[],                                 
+    summary         text             not null,              
+    nature          text             not null default 'fact', 
     importance      double precision not null default 0.5 check (importance between 0 and 1),
     confidence      double precision not null default 0.7 check (confidence between 0 and 1),
     embedding       vector(384),
-    embedding_model text,                                  -- which model produced `embedding`; set by bot.js on insert/merge
+    embedding_model text,                                  
     status          text             not null default 'active'
                         check (status in ('active', 'fading', 'archived', 'forgotten')),
-    evidence_count  integer          not null default 1,    -- how many times this was re-observed / merged
-    access_count    integer          not null default 0,    -- how many times it was recalled
+    evidence_count  integer          not null default 1,    
+    access_count    integer          not null default 0,    
     last_accessed   timestamptz      not null default now(),
     created_at      timestamptz      not null default now()
 );
@@ -33,6 +30,9 @@ create table if not exists public.long_term_memory (
 
 alter table public.long_term_memory add column if not exists embedding_model text;
 alter table public.long_term_memory add column if not exists subject_id text;
+alter table public.long_term_memory add column if not exists subject_is_person boolean;
+alter table public.long_term_memory add column if not exists source_ids text[];
+alter table public.long_term_memory add column if not exists source_names text[];
 
 create index if not exists long_term_memory_guild_status_idx
     on public.long_term_memory (guild_id, status, created_at desc);
@@ -42,19 +42,19 @@ create index if not exists long_term_memory_subject_id_idx
 
 
 
-
-
 create table if not exists public.beliefs (
     id              bigint generated always as identity primary key,
     guild_id        text             not null,
     scope           text             not null default 'user', 
     subject         text,                                     
     subject_id      text,                                     
+    source_ids      text[],                                   
+    source_names    text[],                                   
     statement       text             not null,
     confidence      double precision not null default 0.45 check (confidence between 0 and 1),
     evidence_count  integer          not null default 1,
     embedding       vector(384),
-    embedding_model text,                                    
+    embedding_model text,                                     
     last_updated    timestamptz      not null default now(),
     created_at      timestamptz      not null default now()
 );
@@ -62,12 +62,13 @@ create table if not exists public.beliefs (
 
 alter table public.beliefs add column if not exists embedding_model text;
 alter table public.beliefs add column if not exists subject_id text;
+alter table public.beliefs add column if not exists source_ids text[];
+alter table public.beliefs add column if not exists source_names text[];
 
 create index if not exists beliefs_guild_idx on public.beliefs (guild_id);
 
 create index if not exists beliefs_subject_id_idx
     on public.beliefs (guild_id, subject_id) where subject_id is not null;
-
 
 
 create table if not exists public.belief_evidence (
@@ -109,11 +110,10 @@ drop index if exists public.user_profiles_guild_user_id_idx;
 create unique index if not exists user_profiles_guild_user_id_idx
     on public.user_profiles (guild_id, user_id);
 
-
 create table if not exists public.relationship_state (
     guild_id      text             not null,
     user_name     text             not null,
-    user_id       text,                            
+    user_id       text,                             -- stable Discord id; nullable, see v3 note above
     rapport       double precision not null default 0.5 check (rapport between 0 and 1),
     current_read  text,
     updated_at    timestamptz      not null default now(),
@@ -129,8 +129,6 @@ create unique index if not exists relationship_state_guild_user_id_idx
 
 
 
-
-
 drop function if exists public.match_long_term_memory(vector, text, integer);
 
 create or replace function public.match_long_term_memory(
@@ -139,23 +137,27 @@ create or replace function public.match_long_term_memory(
     match_count      integer default 15
 )
 returns table (
-    id             bigint,
-    subject        text,
-    subject_id     text,
-    summary        text,
-    nature         text,
-    importance     double precision,
-    confidence     double precision,
-    status         text,
-    last_accessed  timestamptz,
-    access_count   integer,
-    similarity     double precision
+    id                bigint,
+    subject           text,
+    subject_id        text,
+    subject_is_person boolean,
+    source_ids        text[],
+    source_names      text[],
+    summary           text,
+    nature            text,
+    importance        double precision,
+    confidence        double precision,
+    status            text,
+    last_accessed     timestamptz,
+    access_count      integer,
+    similarity        double precision
 )
 language sql
 stable
 set search_path = public, extensions
 as $$
-    select m.id, m.subject, m.subject_id, m.summary, m.nature, m.importance, m.confidence, m.status,
+    select m.id, m.subject, m.subject_id, m.subject_is_person, m.source_ids, m.source_names,
+           m.summary, m.nature, m.importance, m.confidence, m.status,
            m.last_accessed, m.access_count,
            1 - (m.embedding <=> query_embedding) as similarity
     from public.long_term_memory m
@@ -165,8 +167,6 @@ as $$
     order by m.embedding <=> query_embedding
     limit match_count;
 $$;
-
-
 
 
 drop function if exists public.find_similar_memory(vector, text, text, text, double precision);
@@ -180,18 +180,22 @@ create or replace function public.find_similar_memory(
     similarity_threshold  double precision default 0.86
 )
 returns table (
-    id              bigint,
-    summary         text,
-    importance      double precision,
-    evidence_count  integer,
-    subject_id      text,
-    similarity      double precision
+    id                bigint,
+    summary           text,
+    importance        double precision,
+    evidence_count    integer,
+    subject_id        text,
+    subject_is_person boolean,
+    source_ids        text[],
+    source_names      text[],
+    similarity        double precision
 )
 language sql
 stable
 set search_path = public, extensions
 as $$
     select m.id, m.summary, m.importance, m.evidence_count, m.subject_id,
+           m.subject_is_person, m.source_ids, m.source_names,
            1 - (m.embedding <=> query_embedding) as similarity
     from public.long_term_memory m
     where m.guild_id = match_guild_id
@@ -211,7 +215,6 @@ as $$
 $$;
 
 
-
 drop function if exists public.reinforce_memories(bigint[]);
 
 create or replace function public.reinforce_memories(memory_ids bigint[])
@@ -225,8 +228,6 @@ as $$
         status        = case when status = 'fading' then 'active' else status end
     where id = any (memory_ids);
 $$;
-
-
 
 
 drop function if exists public.decay_long_term_memory(text);
@@ -313,7 +314,6 @@ begin
 end
 $$;
 
--- Make the API pick up the new tables and functions right away
 notify pgrst, 'reload schema';
 
 
